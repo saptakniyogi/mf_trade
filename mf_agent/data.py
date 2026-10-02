@@ -1,0 +1,509 @@
+from __future__ import annotations
+
+import concurrent.futures
+import json
+import logging
+import os
+import re
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import pandas as pd
+import requests
+from mftool import Mftool
+
+from .config import Settings
+from .models import FundRecord, Holding
+from .utils import safe_float
+
+logger = logging.getLogger("mf_agent")
+
+AMFI_NAV_URL = "https://www.amfiindia.com/spages/NAVAll.txt"
+
+# Deliberately broad, deterministic classification. The engine can only score
+# what it can identify, so the rules cover common Indian MF naming conventions.
+CATEGORY_RULES = [
+    ("Flexi Cap", ["flexi cap", "flexicap"]),
+    ("Large & Mid Cap", ["large & mid", "large and mid", "large-mid"]),
+    ("Large Cap", ["large cap", "largecap"]),
+    ("Mid Cap", ["mid cap", "midcap"]),
+    ("Small Cap", ["small cap", "smallcap"]),
+    ("Focused", ["focused fund", "focused"]),
+    ("ELSS", ["elss", "tax saver"]),
+    ("Index / Passive", ["nifty", "sensex", "index fund", "index -", "etf"]),
+    ("Balanced Advantage / Hybrid", ["balanced advantage", "dynamic asset", "aggressive hybrid", "equity savings", "multi asset", "arbitrage"]),
+    ("Corporate Bond", ["corporate bond"]),
+    ("Banking & PSU Debt", ["banking and psu", "banking & psu"]),
+    ("Short Duration", ["short duration"]),
+    ("Medium Duration", ["medium duration"]),
+    ("Long Duration", ["long duration"]),
+    ("Liquid / Money Market", ["liquid fund", "money market", "overnight fund"]),
+    ("Thematic / Sectoral", ["technology", "tech fund", "pharma", "healthcare", "infrastructure", "manufacturing", "consumption", "defence", "energy"]),
+]
+
+
+def _normalise_scheme_text(value: str) -> str:
+    """Normalize AMFI scheme/plan/option text for resilient matching."""
+    return re.sub(r"\\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(value).lower())).strip()
+
+
+def is_direct_growth_scheme(name: str, plan: str | None = None, option: str | None = None) -> bool:
+    """
+    Identify Direct + Growth schemes across AMFI NAVAll formats.
+
+    AMFI has used both:
+      - a 6-column format where plan/option are embedded in Scheme Name
+      - an 8-column format where Plan and Option are separate fields.
+
+    Never infer Growth from an ISIN field. Explicit Plan/Option fields take
+    precedence when available.
+    """
+    name_n = _normalise_scheme_text(name)
+    plan_n = _normalise_scheme_text(plan or "")
+    option_n = _normalise_scheme_text(option or "")
+
+    direct = "direct" in plan_n if plan_n else "direct" in name_n
+    growth = "growth" in option_n if option_n else (
+        "growth" in name_n
+        and "idcw" not in name_n
+        and "dividend" not in name_n
+        and "payout" not in name_n
+        and "reinvestment" not in name_n
+    )
+
+    # If explicit AMFI Plan/Option fields exist, trust them.
+    if plan_n or option_n:
+        return direct and growth and not any(
+            token in option_n for token in ("idcw", "dividend", "payout", "reinvestment")
+        )
+
+    return direct and growth
+
+
+def classify_category(name: str, amfi_category: str | None = None) -> str:
+    # Prefer an explicit AMFI section/category when it maps to one of our
+    # supported analytical buckets; otherwise classify from the scheme name.
+    combined = " ".join(
+        x for x in (str(amfi_category or ""), str(name or "")) if x
+    ).lower()
+    for category, keywords in CATEGORY_RULES:
+        if any(k in combined for k in keywords):
+            return category
+    return "Other"
+
+
+def load_holdings(settings: Settings) -> tuple[dict[str, Holding], dict]:
+    try:
+        deployable = float(os.getenv("MF_INVESTMENT_AMOUNT", "10000"))
+    except ValueError:
+        deployable = 10000.0
+    funds = {"available_cash": deployable, "deployable_cash": deployable}
+    if not os.path.exists(settings.mf_holdings_path):
+        logger.info("Holdings file '%s' not found. Continuing without existing holdings.", settings.mf_holdings_path)
+        return {}, funds
+
+    try:
+        with open(settings.mf_holdings_path, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+        items = raw.get("mf_holdings", []) if isinstance(raw, dict) else raw
+        holdings: dict[str, Holding] = {}
+        for item in items:
+            if not isinstance(item, dict) or not item.get("fund"):
+                continue
+            name = item["fund"].strip()
+            avg = safe_float(item.get("average_price"), 0.0)
+            qty = safe_float(item.get("quantity"), 0.0)
+            invested = safe_float(item.get("invested_value"), avg * qty)
+            current = safe_float(item.get("current_value"), 0.0)
+            pnl = safe_float(item.get("pnl"), current - invested)
+            pnl_pct = (pnl / invested * 100.0) if invested else 0.0
+            holdings[name] = Holding(
+                scheme_name=name,
+                current_value=current,
+                invested_value=invested,
+                pnl=pnl,
+                pnl_pct=pnl_pct,
+                folio=item.get("folio"),
+                ticker_symbol=item.get("tradingsymbol"),
+                last_price_date=item.get("last_price_date"),
+            )
+        logger.info("Loaded %d existing mutual-fund holdings.", len(holdings))
+        return holdings, funds
+    except Exception as exc:
+        logger.warning("Could not load holdings: %s", exc)
+        return {}, funds
+
+
+def _historical_metrics(mf: Mftool, code: str) -> dict:
+    try:
+        raw = mf.get_scheme_historical_nav(code)
+        rows = raw.get("data", []) if isinstance(raw, dict) else []
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return {}
+        df["date"] = pd.to_datetime(df["date"], format="%d-%m-%Y", errors="coerce")
+        df["nav"] = pd.to_numeric(df["nav"], errors="coerce")
+        df = df.dropna().sort_values("date")
+        if len(df) < 2:
+            return {}
+        latest = float(df.iloc[-1]["nav"])
+        latest_date = df.iloc[-1]["date"]
+        result = {}
+        for years in (1, 3, 5):
+            target = latest_date - timedelta(days=int(years * 365.25))
+            prior = df[df["date"] <= target]
+            if prior.empty:
+                continue
+            old = float(prior.iloc[-1]["nav"])
+            if old > 0 and latest > 0:
+                result[f"cagr_{years}y_pct"] = round(((latest / old) ** (1 / years) - 1) * 100, 2)
+        return result
+    except Exception as exc:
+        logger.debug("Historical NAV failed for %s: %s", code, exc)
+        return {}
+
+
+
+def _valid_nav_date(value: object) -> str | None:
+    """Return a normalized NAV date; reject plan/option/header strings."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    for fmt in ("%d-%b-%Y", "%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt).date().isoformat()
+        except ValueError:
+            continue
+    logger.warning("INVALID_NAV_DATE: %r", raw)
+    return None
+
+def _fund_record(mf: Mftool, item: dict, holdings: dict[str, Holding]) -> FundRecord:
+    name = item["scheme_name"]
+    code = str(item.get("code", ""))
+    quote = {}
+    details = {}
+    if code:
+        try:
+            quote = mf.get_scheme_quote(code) or {}
+            details = mf.get_scheme_details(code) or {}
+        except Exception as exc:
+            logger.debug("mftool quote/details failed for %s: %s", name, exc)
+
+    hist = _historical_metrics(mf, code) if code else {}
+    category = details.get("scheme_category") or item.get("category") or classify_category(name)
+    amc = details.get("fund_house") or item.get("amc") or "Unknown"
+    nav = safe_float(quote.get("nav"))
+    if nav is None:
+        nav = safe_float(item.get("nav"))
+    nav_date = _valid_nav_date(quote.get("last_updated") or item.get("date"))
+
+    return FundRecord(
+        scheme_name=name,
+        scheme_code=code,
+        category=category,
+        amc=amc,
+        latest_nav=nav,
+        nav_date=nav_date,
+        cagr_1y_pct=hist.get("cagr_1y_pct"),
+        cagr_3y_pct=hist.get("cagr_3y_pct"),
+        cagr_5y_pct=hist.get("cagr_5y_pct"),
+        benchmark="Nifty 50 TRI" if any(x in category.lower() for x in ("large", "flexi", "index")) else None,
+    )
+
+
+def _parse_amfi_catalog(text: str) -> dict[str, dict]:
+    """
+    Parse AMFI NAVAll.txt defensively.
+
+    Supported row layouts:
+      6 columns: code;isin1;isin2;scheme_name;nav;date
+      8 columns: code;isin1;isin2;scheme_name;plan;option;nav;date
+
+    AMFI also emits AMC/category section headers. Those are retained as
+    metadata so category/AMC information is not lost before filtering.
+    """
+    catalog: dict[str, dict] = {}
+    current_amc = None
+    current_category = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        parts = [p.strip() for p in line.split(";")]
+
+        # Section/AMC headers do not contain a scheme code.
+        if not parts[0].isdigit():
+            if ";" not in line:
+                header = line.strip()
+                if "scheme" in header.lower() and "open ended" not in header.lower():
+                    continue
+                if header.startswith("(") or "scheme" in header.lower():
+                    current_category = header
+                elif header:
+                    current_amc = header
+            continue
+
+        if len(parts) >= 8:
+            code, isin_div, isin_reinv, scheme_name, plan, option, nav, date = parts[:8]
+        elif len(parts) >= 6:
+            code, isin_div, isin_reinv, scheme_name, nav, date = parts[:6]
+            plan = ""
+            option = ""
+        else:
+            continue
+
+        if not scheme_name:
+            continue
+
+        catalog[code] = {
+            "scheme_name": scheme_name,
+            "nav": nav,
+            "date": date,
+            "isin_growth": isin_div,
+            "isin_div": isin_reinv,
+            "plan": plan,
+            "option": option,
+            "amc": current_amc,
+            "amfi_category": current_category,
+        }
+
+    return catalog
+
+
+def _load_cached_catalog(settings: Settings) -> dict[str, dict] | None:
+    cache_dir = Path(settings.market_cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = cache_dir / "amfi_nav_catalog_v2.json"
+    ttl_hours = float(os.getenv("AMFI_CATALOG_CACHE_HOURS", "12"))
+    if not path.exists():
+        return None
+    try:
+        age_hours = (time.time() - path.stat().st_mtime) / 3600
+        if age_hours > ttl_hours:
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _save_catalog(settings: Settings, catalog: dict[str, dict]) -> None:
+    path = Path(settings.market_cache_dir) / "amfi_nav_catalog.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(catalog, ensure_ascii=False), encoding="utf-8")
+
+
+def fetch_amfi_catalog(settings: Settings) -> dict[str, dict]:
+    cached = _load_cached_catalog(settings)
+    if cached:
+        cached_direct = sum(
+            1 for item in cached.values()
+            if is_direct_growth_scheme(
+                item.get("scheme_name", ""),
+                item.get("plan"),
+                item.get("option"),
+            )
+        )
+        # A previous cache version did not retain Plan/Option and can therefore
+        # silently produce an empty universe. Do not trust such a cache.
+        if cached_direct > 0:
+            logger.info(
+                "AMFI catalog loaded from cache: %d schemes (%d Direct/Growth).",
+                len(cached), cached_direct
+            )
+            return cached
+        logger.warning(
+            "AMFI cache contains %d schemes but 0 Direct/Growth records; "
+            "refreshing cache with current NAVAll schema.",
+            len(cached),
+        )
+
+    logger.info("Fetching AMFI scheme catalog from %s", AMFI_NAV_URL)
+    headers = {"User-Agent": "Mozilla/5.0 MF Research Dashboard/2.2"}
+    try:
+        response = requests.get(AMFI_NAV_URL, headers=headers, timeout=30)
+        response.raise_for_status()
+        catalog = _parse_amfi_catalog(response.text)
+        if not catalog:
+            raise RuntimeError("AMFI returned an empty/unparseable NAV catalog")
+
+        direct_count = sum(
+            1 for item in catalog.values()
+            if is_direct_growth_scheme(
+                item.get("scheme_name", ""),
+                item.get("plan"),
+                item.get("option"),
+            )
+        )
+        logger.info(
+            "AMFI parser produced %d schemes, including %d Direct/Growth.",
+            len(catalog), direct_count
+        )
+        if direct_count == 0:
+            raise RuntimeError(
+                "AMFI catalog parsed successfully but contains 0 Direct/Growth "
+                "schemes; feed schema may have changed."
+            )
+
+        _save_catalog(settings, catalog)
+        logger.info("AMFI catalog fetched successfully: %d schemes.", len(catalog))
+        return catalog
+    except Exception as exc:
+        logger.warning("AMFI catalog fetch failed: %s", exc)
+        return {}
+
+
+def _mftool_catalog(mf: Mftool) -> dict[str, str]:
+    try:
+        schemes = mf.get_scheme_codes() or {}
+        if isinstance(schemes, dict):
+            logger.info("mftool catalog returned %d schemes.", len(schemes))
+            return {str(k): str(v) for k, v in schemes.items()}
+    except Exception as exc:
+        logger.warning("mftool scheme catalog failed: %s", exc)
+    return {}
+
+
+def fetch_universe(settings: Settings, mf: Mftool) -> list[dict]:
+    """Build a deterministic candidate universe with AMFI as the primary fallback."""
+    amfi = fetch_amfi_catalog(settings)
+    mftool = _mftool_catalog(mf)
+
+    # AMFI is preferred because it gives us a complete current scheme catalogue.
+    if amfi:
+        source = "AMFI"
+        schemes = amfi
+        items = [(code, item["scheme_name"], item) for code, item in schemes.items()]
+    elif mftool:
+        source = "mftool"
+        items = [(code, name, {"scheme_name": name}) for code, name in mftool.items()]
+    else:
+        logger.error("No mutual-fund scheme catalogue is available from AMFI or mftool.")
+        return []
+
+    direct_growth = 0
+    categorized = 0
+    candidates = []
+    per_category: dict[str, int] = {}
+    per_amc_category: dict[tuple[str, str], int] = {}
+
+    direct_samples: list[str] = []
+    category_samples: list[str] = []
+
+    for code, name, meta in sorted(items, key=lambda x: str(x[1]).lower()):
+        if not is_direct_growth_scheme(
+            name,
+            meta.get("plan"),
+            meta.get("option"),
+        ):
+            continue
+
+        direct_growth += 1
+        if len(direct_samples) < 5:
+            direct_samples.append(str(name))
+
+        category = classify_category(name, meta.get("amfi_category"))
+        if category == "Other":
+            continue
+
+        categorized += 1
+        if len(category_samples) < 5:
+            category_samples.append(f"{name} -> {category}")
+
+        # Use explicit AMFI AMC metadata when available. Fall back to the
+        # first token only for older/mftool-only records.
+        amc = str(meta.get("amc") or str(name).split()[0]).strip().lower()
+        key = (category, amc)
+        if per_category.get(category, 0) >= settings.max_schemes_per_category:
+            continue
+        if per_amc_category.get(key, 0) >= settings.max_per_amc_per_category:
+            continue
+        candidates.append({
+            "scheme_name": name,
+            "category": category,
+            "amc": amc,
+            "code": str(code),
+            "nav": meta.get("nav"),
+            "date": meta.get("date"),
+        })
+        per_category[category] = per_category.get(category, 0) + 1
+        per_amc_category[key] = per_amc_category.get(key, 0) + 1
+
+    logger.info(
+        "Universe pipeline [%s]: catalog=%d, direct_growth=%d, recognized_category=%d, selected=%d.",
+        source, len(items), direct_growth, categorized, len(candidates),
+    )
+    if direct_samples:
+        logger.info("Direct/Growth samples: %s", " | ".join(direct_samples))
+    if category_samples:
+        logger.info("Category samples: %s", " | ".join(category_samples))
+    if not candidates:
+        logger.error(
+            "Universe is empty. Check AMFI connectivity, Direct/Growth naming, and category rules."
+        )
+    return candidates
+
+
+def load_optional_factsheet_data(settings: Settings, scheme_name: str) -> dict:
+    """Optional local factsheet/holdings enrichment. Missing data is explicit, never invented."""
+    safe_name = "".join(c if c.isalnum() else "_" for c in scheme_name).strip("_")
+    path = os.path.join(settings.factsheet_dir, f"{safe_name}.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        logger.warning("Factsheet parse failed for %s: %s", scheme_name, exc)
+        return {}
+
+
+def build_fund_universe(settings: Settings, holdings: dict[str, Holding]) -> list[FundRecord]:
+    logger.info("Starting mutual-fund data pipeline...")
+    mf = Mftool()
+    raw = fetch_universe(settings, mf)
+    held_names = {name.lower(): name for name in holdings}
+    for name in holdings:
+        if not any(x["scheme_name"].lower() == name.lower() for x in raw):
+            raw.append({"scheme_name": name, "category": "Holding Scheme", "amc": "Unknown", "code": ""})
+    logger.info("Candidate universe after existing holdings: %d funds.", len(raw))
+
+    records: list[FundRecord] = []
+    if not raw:
+        return records
+
+    # mftool is not guaranteed to be thread-safe. Use separate clients per worker
+    # rather than sharing one mutable client across threads.
+    def process(item: dict):
+        client = Mftool()
+        return _fund_record(client, item, holdings)
+
+    workers = max(1, min(4, int(os.getenv("MF_DATA_WORKERS", "3"))))
+    logger.info("Fetching fund NAV/history with %d workers...", workers)
+    completed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(process, item) for item in raw]
+        for future in concurrent.futures.as_completed(futures):
+            completed += 1
+            try:
+                record = future.result()
+                extra = load_optional_factsheet_data(settings, record.scheme_name)
+                for key in ("aum_inr_cr", "inception_date", "volatility_pct", "max_drawdown_pct", "sharpe", "sortino", "benchmark"):
+                    if key in extra:
+                        setattr(record, key, extra[key])
+                for key in ("sector_weights", "holdings", "market_cap_weights", "valuation"):
+                    if isinstance(extra.get(key), dict):
+                        setattr(record, key, extra[key])
+                records.append(record)
+            except Exception as exc:
+                logger.warning("Fund processing failed: %s", exc)
+            if completed % 10 == 0 or completed == len(raw):
+                logger.info("Fund data progress: %d/%d completed.", completed, len(raw))
+
+    records.sort(key=lambda x: (x.category.lower(), x.scheme_name.lower()))
+    logger.info("Fund data pipeline complete: %d/%d fund records built.", len(records), len(raw))
+    return records

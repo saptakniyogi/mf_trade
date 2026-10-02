@@ -1,0 +1,91 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# IDEs / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+*.json
+
+# Test / coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Local caches / generated data
+cache/
+data/cache/
+*.cache
+*.tmp
+*.temp
+
+# Vector / embedding indexes
+vector_store/
+embeddings/
+*.faiss
+*.index
+
+# Model files
+models/
+*.gguf
+*.bin
+*.safetensors
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Generated analysis outputs
+outputs/
+reports/
+results/
+*.jsonl
+
+# OS files
+Thumbs.db
