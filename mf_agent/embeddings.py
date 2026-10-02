@@ -249,15 +249,32 @@ def retrieve_relevant_funds(candidates: list[dict], engine_result: dict, top_k: 
 def retrieve_relevant_news(news: list[dict], selected_funds: list[dict], top_k: int = 10, store_dir: str | Path | None = None) -> list[dict]:
     if not news:
         return []
-    fund_text = " ".join(fund_document(x) for x in selected_funds)
+    categories = " ".join(str(x.get("category", "")) for x in selected_funds)
+    names = " ".join(str(x.get("scheme_name", "")) for x in selected_funds[:8])
+    # Query the event vocabulary, not the full numeric fund payload. This avoids
+    # retrieving generic articles merely because they contain words like "fund"
+    # or "portfolio".
+    event_query = _clean(
+        f"{categories} {names} RBI inflation rates oil crude rupee FII FPI DII "
+        "earnings growth recession valuation liquidity regulation geopolitics market"
+    )
     docs = [news_document(x) for x in news]
     index = build_index(docs, collection="news", store_dir=store_dir)
-    hits = index.search(fund_text, top_k=min(top_k, len(news)))
+    hits = index.search(event_query, top_k=min(max(top_k * 2, top_k), len(news)))
     result = []
     for idx, similarity in hits:
         item = dict(news[idx])
+        # TF-IDF is lexical retrieval, so reject weak matches rather than
+        # pretending low similarity is meaningful evidence. Event-tagged news
+        # gets a lower threshold because the deterministic classifier already
+        # established a market-moving channel.
+        threshold = 0.12 if item.get("event_tags") else 0.20
+        if similarity < threshold:
+            continue
         item["vector_similarity"] = round(similarity, 4)
         result.append(item)
+        if len(result) >= top_k:
+            break
     logger.info(
         "Local news retrieval: %d articles -> %d relevant articles; cache_hit=%s",
         len(news), len(result), index.cache_hit,

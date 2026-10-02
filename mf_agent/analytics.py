@@ -35,8 +35,8 @@ def fund_data_quality(fund: FundRecord) -> tuple[float, list[str]]:
     Missing fields are not treated as neutral investment evidence.
     """
     checks = [
-        (fund.cagr_3y_pct is not None, 12),
-        (fund.cagr_5y_pct is not None, 15),
+        (fund.cagr_3y_pct is not None, 10),
+        (fund.cagr_5y_pct is not None, 12),
         (fund.sharpe is not None or fund.sortino is not None, 15),
         (fund.volatility_pct is not None, 10),
         (fund.max_drawdown_pct is not None, 10),
@@ -46,6 +46,7 @@ def fund_data_quality(fund: FundRecord) -> tuple[float, list[str]]:
         (bool(fund.valuation), 5),
         (bool(fund.benchmark), 3),
         (fund.aum_inr_cr is not None, 2),
+        (fund.latest_nav is not None and fund.nav_date is not None, 5),
     ]
     score = sum(weight for present, weight in checks if present)
     warnings = []
@@ -61,6 +62,7 @@ def fund_data_quality(fund: FundRecord) -> tuple[float, list[str]]:
         (bool(fund.valuation), "Valuation data unavailable."),
         (bool(fund.benchmark), "Benchmark unavailable."),
         (fund.aum_inr_cr is not None, "AUM unavailable."),
+        (fund.latest_nav is not None and fund.nav_date is not None, "Current NAV/date unavailable."),
     ]
     warnings.extend(message for present, message in labels if not present)
     return round(float(score), 2), warnings

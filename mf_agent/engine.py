@@ -28,7 +28,8 @@ class ResearchEngine:
         topics = [x.strip() for x in __import__("os").getenv("TRENDING_TOPICS", "").split(",") if x.strip()]
         macro = fetch_macro_snapshot(topics)
         raw_news = fetch_news(self.settings)
-        news = [classify_event(x) for x in filter_relevant_news(raw_news, limit=40)]
+        classified_news = [classify_event(x) for x in raw_news]
+        news = filter_relevant_news(classified_news, limit=40)
         regime = infer_regime(macro, news)
         funds = build_fund_universe(self.settings, holdings)
 

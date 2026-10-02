@@ -105,32 +105,28 @@ NEWS_RELEVANCE_TERMS = (
     "tariff", "trade", "bond yield", "10-year", "treasury", "earnings",
     "corporate profit", "credit", "liquidity", "monsoon", "geopolit",
     "sanction", "war", "market", "fund house", "asset management", "sebi",
-    "gold", "commodity", "valuation", "ipo", "budget",
+    "gold", "commodity", "valuation", "ipo", "budget", "recession",
+)
+GENERIC_ADVICE_TERMS = (
+    "how to invest", "how should you invest", "best mutual funds", "best funds",
+    "mutual funds to buy", "portfolio tips", "portfolio advice", "sip tips",
+    "where to invest", "should you invest", "investment strategy", "investor guide",
+    "personal finance", "tax saving tips", "wealth creation tips",
 )
 
-def filter_relevant_news(news: list[dict], limit: int = 40) -> list[dict]:
-    """Remove generic consumer/personal-news noise before vector retrieval."""
-    relevant = []
-    for article in news:
-        text = (article.get("title", "") + " " + article.get("summary", "")).lower()
-        tags = set(article.get("event_tags", []))
-        if tags or any(term in text for term in NEWS_RELEVANCE_TERMS):
-            relevant.append(article)
-    result = relevant[:max(0, int(limit))]
-    logger.info("News relevance filter: %d raw -> %d market-relevant articles.", len(news), len(result))
-    return result
 
 def classify_event(article: dict) -> dict:
     """Deterministic first-pass event tagging. LLM can refine, but cannot invent source facts."""
     text = (article.get("title", "") + " " + article.get("summary", "")).lower()
     tags = set()
-    channels = []
     for keyword, tag in [
         ("oil", "oil"), ("crude", "oil"), ("inflation", "inflation"),
         ("rupee", "currency"), ("tariff", "trade"), ("war", "geopolitics"),
         ("sanction", "geopolitics"), ("monsoon", "climate"), ("el niño", "climate"),
         ("fii", "foreign_flows"), ("fpi", "foreign_flows"), ("rbi", "rates"),
-        ("interest rate", "rates"), ("ipo", "equity_supply"),
+        ("interest rate", "rates"), ("repo rate", "rates"), ("ipo", "equity_supply"),
+        ("recession", "growth"), ("gdp", "growth"), ("earnings", "earnings"),
+        ("profit", "earnings"), ("bond yield", "rates"), ("sebi", "regulation"),
     ]:
         if keyword in text:
             tags.add(tag)
@@ -138,9 +134,33 @@ def classify_event(article: dict) -> dict:
         "oil": "inflation", "currency": "inflation", "trade": "earnings",
         "geopolitics": "risk_premium", "climate": "food_inflation",
         "foreign_flows": "liquidity", "rates": "discount_rate",
-        "equity_supply": "liquidity",
+        "equity_supply": "liquidity", "growth": "earnings", "earnings": "earnings",
+        "regulation": "policy",
     }
     channels = sorted({mapping[t] for t in tags if t in mapping})
     article["event_tags"] = sorted(tags)
     article["transmission_channels"] = channels
     return article
+
+
+def filter_relevant_news(news: list[dict], limit: int = 40) -> list[dict]:
+    """Keep market-moving events and remove generic fund-buying/advice articles."""
+    relevant = []
+    for article in news:
+        title = str(article.get("title", ""))
+        summary = str(article.get("summary", ""))
+        text = (title + " " + summary).lower()
+        tags = set(article.get("event_tags", []))
+        generic = any(term in text for term in GENERIC_ADVICE_TERMS)
+        strong_market_signal = any(term in text for term in NEWS_RELEVANCE_TERMS)
+        if generic and not tags:
+            continue
+        if tags or strong_market_signal:
+            relevant.append(article)
+    # Events are more useful than generic market commentary. Preserve source
+    # order within the two groups so the feed's recency ordering is retained.
+    relevant.sort(key=lambda x: (0 if x.get("event_tags") else 1))
+    result = relevant[:max(0, int(limit))]
+    logger.info("News relevance filter: %d raw -> %d event/market-relevant articles.", len(news), len(result))
+    return result
+

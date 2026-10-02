@@ -9,9 +9,13 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import requests
-from mftool import Mftool
+try:
+    from mftool import Mftool
+except ImportError:  # Keep AMFI-only mode usable if the optional client is unavailable.
+    Mftool = None  # type: ignore[assignment,misc]
 
 from .config import Settings
 from .models import FundRecord, Holding
@@ -45,7 +49,7 @@ CATEGORY_RULES = [
 
 def _normalise_scheme_text(value: str) -> str:
     """Normalize AMFI scheme/plan/option text for resilient matching."""
-    return re.sub(r"\\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(value).lower())).strip()
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(value).lower())).strip()
 
 
 def is_direct_growth_scheme(name: str, plan: str | None = None, option: str | None = None) -> bool:
@@ -135,55 +139,163 @@ def load_holdings(settings: Settings) -> tuple[dict[str, Holding], dict]:
         return {}, funds
 
 
-def _historical_metrics(mf: Mftool, code: str) -> dict:
-    try:
-        raw = mf.get_scheme_historical_nav(code)
-        rows = raw.get("data", []) if isinstance(raw, dict) else []
-        df = pd.DataFrame(rows)
-        if df.empty:
-            return {}
-        df["date"] = pd.to_datetime(df["date"], format="%d-%m-%Y", errors="coerce")
-        df["nav"] = pd.to_numeric(df["nav"], errors="coerce")
-        df = df.dropna().sort_values("date")
-        if len(df) < 2:
-            return {}
-        latest = float(df.iloc[-1]["nav"])
-        latest_date = df.iloc[-1]["date"]
-        result = {}
-        for years in (1, 3, 5):
-            target = latest_date - timedelta(days=int(years * 365.25))
-            prior = df[df["date"] <= target]
-            if prior.empty:
-                continue
-            old = float(prior.iloc[-1]["nav"])
-            if old > 0 and latest > 0:
-                result[f"cagr_{years}y_pct"] = round(((latest / old) ** (1 / years) - 1) * 100, 2)
-        return result
-    except Exception as exc:
-        logger.debug("Historical NAV failed for %s: %s", code, exc)
+def _parse_nav_history(raw: object) -> pd.DataFrame:
+    """Normalize NAV history from mftool or compatible APIs."""
+    rows = raw.get("data", []) if isinstance(raw, dict) else []
+    if not isinstance(rows, list):
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    if not {"date", "nav"}.issubset(df.columns):
+        return pd.DataFrame()
+    # mftool returns DD-MM-YYYY. Some fallback sources use ISO dates.
+    df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
+    df["nav"] = pd.to_numeric(df["nav"], errors="coerce")
+    df = df.dropna(subset=["date", "nav"])
+    df = df[df["nav"] > 0]
+    if df.empty:
+        return df
+    df = df.sort_values("date").drop_duplicates("date", keep="last")
+    # NAV is an end-of-day series. Weekend rows, if any, are not useful for
+    # annualized volatility and can otherwise create artificial zero returns.
+    df = df[df["date"].dt.dayofweek < 5]
+    return df.reset_index(drop=True)
+
+
+def _fetch_history_fallback(code: str) -> dict:
+    """Fallback historical NAV source when mftool is unavailable/broken.
+
+    AMFI's NAV history remains the authoritative source; this public mirror is
+    only used as a resilience fallback so one mftool failure does not erase all
+    quantitative risk metrics.
+    """
+    if not code:
         return {}
+    url = f"https://api.mfapi.in/mf/{code}"
+    try:
+        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0 MF Research Dashboard/2.4"}, timeout=20)
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {}
+    except Exception as exc:
+        logger.debug("Historical NAV fallback failed for %s: %s", code, exc)
+        return {}
+
+
+def _historical_metrics(mf: Mftool | None, code: str) -> dict:
+    try:
+        raw = mf.get_scheme_historical_nav(code) if mf is not None and code else None
+    except Exception as exc:
+        logger.debug("mftool historical NAV failed for %s: %s", code, exc)
+        raw = None
+    df = _parse_nav_history(raw)
+    if df.empty:
+        df = _parse_nav_history(_fetch_history_fallback(code))
+    if df.empty or len(df) < 2:
+        return {}
+
+    latest = float(df.iloc[-1]["nav"])
+    latest_date = df.iloc[-1]["date"]
+    result: dict[str, object] = {
+        "history_start_date": latest_date.date().isoformat(),
+        "history_end_date": latest_date.date().isoformat(),
+        "history_days": int(len(df)),
+    }
+    first_date = df.iloc[0]["date"]
+    result["history_start_date"] = first_date.date().isoformat()
+    result["history_years"] = round(max(0.0, (latest_date - first_date).days / 365.25), 2)
+
+    for years in (1, 3, 5):
+        target = latest_date - timedelta(days=int(years * 365.25))
+        prior = df[df["date"] <= target]
+        if prior.empty:
+            continue
+        old = float(prior.iloc[-1]["nav"])
+        if old > 0 and latest > 0:
+            result[f"cagr_{years}y_pct"] = round(((latest / old) ** (1 / years) - 1) * 100, 2)
+
+    risk_start = latest_date - timedelta(days=int(5 * 365.25))
+    risk_df = df[df["date"] >= risk_start]
+    nav = risk_df["nav"].astype(float)
+    daily_returns = nav.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+    if len(daily_returns) >= 30:
+        daily_vol = float(daily_returns.std(ddof=1))
+        result["volatility_pct"] = float(round(daily_vol * np.sqrt(252) * 100, 2))
+        rf_annual = float(os.getenv("RISK_FREE_RATE_PCT", "6.0")) / 100.0
+        rf_daily = (1.0 + rf_annual) ** (1 / 252) - 1
+        excess = daily_returns - rf_daily
+        excess_std = float(excess.std(ddof=1))
+        if excess_std > 1e-6 and daily_vol > 1e-6:
+            sharpe = float(excess.mean() / excess_std * np.sqrt(252))
+            if -10.0 <= sharpe <= 10.0:
+                result["sharpe"] = round(sharpe, 3)
+        downside = excess[excess < 0]
+        downside_std = float(downside.std(ddof=1)) if len(downside) > 1 else 0.0
+        if downside_std > 1e-6:
+            sortino = float(excess.mean() / downside_std * np.sqrt(252))
+            if -15.0 <= sortino <= 15.0:
+                result["sortino"] = round(sortino, 3)
+
+        running_max = nav.cummax()
+        drawdown = nav / running_max - 1.0
+        result["max_drawdown_pct"] = round(float(drawdown.min() * 100), 2)
+
+    return result
+
+
+def _benchmark_from_name(name: str) -> str | None:
+    """Infer a benchmark only when the scheme name explicitly identifies an index.
+
+    Active-fund benchmarks are not guessed. They remain unknown unless supplied
+    by a local factsheet/enrichment file.
+    """
+    n = _normalise_scheme_text(name)
+    patterns = [
+        (r"\bnifty\s+smallcap\s+250\b", "Nifty Smallcap 250 TRI"),
+        (r"\bnifty\s+smallcap\s+100\b", "Nifty Smallcap 100 TRI"),
+        (r"\bnifty\s+smallcap\s+50\b", "Nifty Smallcap 50 TRI"),
+        (r"\bnifty\s+midcap\s+150\b", "Nifty Midcap 150 TRI"),
+        (r"\bnifty\s+midcap\s+100\b", "Nifty Midcap 100 TRI"),
+        (r"\bnifty\s+financial\s+services\b", "Nifty Financial Services TRI"),
+        (r"\bnifty\s+next\s+50\b", "Nifty Next 50 TRI"),
+        (r"\bnifty\s+500\b", "Nifty 500 TRI"),
+        (r"\bnifty\s+200\b", "Nifty 200 TRI"),
+        (r"\bnifty\s+100\b", "Nifty 100 TRI"),
+        (r"\bnifty\s+50\b", "Nifty 50 TRI"),
+        (r"\bnifty\s+bank\b", "Nifty Bank TRI"),
+        (r"\bnifty\s+it\b", "Nifty IT TRI"),
+        (r"\bnifty\s+pharma\b", "Nifty Pharma TRI"),
+        (r"\bnifty.*?equal\s+weight", "Relevant Nifty Equal Weight TRI"),
+        (r"\bsensex\b", "BSE Sensex TRI"),
+    ]
+    for pattern, benchmark in patterns:
+        if re.search(pattern, n):
+            return benchmark
+    return None
 
 
 
 def _valid_nav_date(value: object) -> str | None:
-    """Return a normalized NAV date; reject plan/option/header strings."""
+    """Return an ISO date and reject plan/option/header strings."""
     raw = str(value or "").strip()
     if not raw:
         return None
-    for fmt in ("%d-%b-%Y", "%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(raw, fmt).date().isoformat()
-        except ValueError:
-            continue
-    logger.warning("INVALID_NAV_DATE: %r", raw)
-    return None
+    parsed = pd.to_datetime(raw, dayfirst=True, errors="coerce")
+    if pd.isna(parsed):
+        logger.warning("INVALID_NAV_DATE: %r", raw)
+        return None
+    # Guard against pandas accepting arbitrary numeric/label-like values.
+    if parsed.year < 1990 or parsed.year > datetime.now().year + 1:
+        logger.warning("INVALID_NAV_DATE_RANGE: %r", raw)
+        return None
+    return parsed.date().isoformat()
 
-def _fund_record(mf: Mftool, item: dict, holdings: dict[str, Holding]) -> FundRecord:
+
+def _fund_record(mf: Mftool | None, item: dict, holdings: dict[str, Holding]) -> FundRecord:
     name = item["scheme_name"]
     code = str(item.get("code", ""))
     quote = {}
     details = {}
-    if code:
+    if code and mf is not None:
         try:
             quote = mf.get_scheme_quote(code) or {}
             details = mf.get_scheme_details(code) or {}
@@ -191,7 +303,7 @@ def _fund_record(mf: Mftool, item: dict, holdings: dict[str, Holding]) -> FundRe
             logger.debug("mftool quote/details failed for %s: %s", name, exc)
 
     hist = _historical_metrics(mf, code) if code else {}
-    category = details.get("scheme_category") or item.get("category") or classify_category(name)
+    category = details.get("scheme_category") or item.get("category") or classify_category(name, item.get("amfi_category"))
     amc = details.get("fund_house") or item.get("amc") or "Unknown"
     nav = safe_float(quote.get("nav"))
     if nav is None:
@@ -208,7 +320,11 @@ def _fund_record(mf: Mftool, item: dict, holdings: dict[str, Holding]) -> FundRe
         cagr_1y_pct=hist.get("cagr_1y_pct"),
         cagr_3y_pct=hist.get("cagr_3y_pct"),
         cagr_5y_pct=hist.get("cagr_5y_pct"),
-        benchmark="Nifty 50 TRI" if any(x in category.lower() for x in ("large", "flexi", "index")) else None,
+        volatility_pct=hist.get("volatility_pct"),
+        max_drawdown_pct=hist.get("max_drawdown_pct"),
+        sharpe=hist.get("sharpe"),
+        sortino=hist.get("sortino"),
+        benchmark=_benchmark_from_name(name),
     )
 
 
@@ -291,7 +407,7 @@ def _load_cached_catalog(settings: Settings) -> dict[str, dict] | None:
 
 
 def _save_catalog(settings: Settings, catalog: dict[str, dict]) -> None:
-    path = Path(settings.market_cache_dir) / "amfi_nav_catalog.json"
+    path = Path(settings.market_cache_dir) / "amfi_nav_catalog_v2.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(catalog, ensure_ascii=False), encoding="utf-8")
 
@@ -356,7 +472,9 @@ def fetch_amfi_catalog(settings: Settings) -> dict[str, dict]:
         return {}
 
 
-def _mftool_catalog(mf: Mftool) -> dict[str, str]:
+def _mftool_catalog(mf: Mftool | None) -> dict[str, str]:
+    if mf is None:
+        return {}
     try:
         schemes = mf.get_scheme_codes() or {}
         if isinstance(schemes, dict):
@@ -464,7 +582,11 @@ def load_optional_factsheet_data(settings: Settings, scheme_name: str) -> dict:
 
 def build_fund_universe(settings: Settings, holdings: dict[str, Holding]) -> list[FundRecord]:
     logger.info("Starting mutual-fund data pipeline...")
-    mf = Mftool()
+    try:
+        mf = Mftool()
+    except Exception as exc:
+        logger.warning("mftool initialization failed; using AMFI + historical fallback: %s", exc)
+        mf = None
     raw = fetch_universe(settings, mf)
     held_names = {name.lower(): name for name in holdings}
     for name in holdings:
@@ -479,7 +601,10 @@ def build_fund_universe(settings: Settings, holdings: dict[str, Holding]) -> lis
     # mftool is not guaranteed to be thread-safe. Use separate clients per worker
     # rather than sharing one mutable client across threads.
     def process(item: dict):
-        client = Mftool()
+        try:
+            client = Mftool()
+        except Exception:
+            client = None
         return _fund_record(client, item, holdings)
 
     workers = max(1, min(4, int(os.getenv("MF_DATA_WORKERS", "3"))))
