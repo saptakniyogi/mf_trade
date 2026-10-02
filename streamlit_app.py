@@ -115,6 +115,27 @@ def load_result():
         return None
 
 
+def load_live_zerodha_holdings():
+    """Read the current Zerodha holdings file directly.
+
+    This is intentionally independent of the research-engine output so the
+    Portfolio tab can show newly imported holdings even before a research
+    analysis has completed successfully.
+    """
+    path = zerodha_holdings_path()
+
+    if not path.exists():
+        return []
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        items = raw.get("mf_holdings", []) if isinstance(raw, dict) else raw
+        return items if isinstance(items, list) else []
+    except Exception as exc:
+        st.warning(f"Could not read {path.name}: {exc}")
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Zerodha
 # ---------------------------------------------------------------------------
@@ -1247,23 +1268,91 @@ with tab_funds:
 # ---------------------------------------------------------------------------
 
 with tab_portfolio:
-    st.subheader("Current holdings")
+    st.subheader("Current Zerodha holdings")
+
+    # Read mf_holdings.json directly. Do not depend on the last research
+    # result, because Zerodha holdings can be refreshed independently.
+    live_holdings = load_live_zerodha_holdings()
+
+    if live_holdings:
+        hrows = []
+        for item in live_holdings:
+            hrows.append(
+                {
+                    "Fund": item.get("fund"),
+                    "Quantity": item.get("quantity"),
+                    "Avg price": item.get("average_price"),
+                    "Current value": item.get("current_value"),
+                    "Invested": item.get("invested_value"),
+                    "P&L": item.get("pnl"),
+                    "P&L %": item.get("pnl_pct"),
+                    "Folio": item.get("folio"),
+                }
+            )
+
+        live_df = pd.DataFrame(hrows)
+        for column in [
+            "Quantity",
+            "Avg price",
+            "Current value",
+            "Invested",
+            "P&L",
+            "P&L %",
+        ]:
+            live_df[column] = pd.to_numeric(
+                live_df[column],
+                errors="coerce",
+            )
+
+        total_current = live_df["Current value"].sum()
+        total_invested = live_df["Invested"].sum()
+        total_pnl = live_df["P&L"].sum()
+        total_pnl_pct = (
+            total_pnl / total_invested * 100
+            if total_invested
+            else 0.0
+        )
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Funds", len(live_df))
+        k2.metric("Current value", money(total_current))
+        k3.metric("Invested", money(total_invested))
+        k4.metric("Total P&L", f"₹{total_pnl:,.0f} ({total_pnl_pct:.1f}%)")
+
+        st.dataframe(
+            live_df,
+            hide_index=True,
+            use_container_width=True,
+        )
+
+        holdings_path = zerodha_holdings_path()
+        try:
+            updated_at = json.loads(
+                holdings_path.read_text(encoding="utf-8")
+            ).get("updated_at")
+        except Exception:
+            updated_at = None
+
+        if updated_at:
+            st.caption(f"Source: {holdings_path.name} · Last synced: {updated_at}")
+    else:
+        st.info(
+            "No live Zerodha holdings are available. "
+            "Connect Zerodha and click **Refresh MF holdings** first."
+        )
+
+    st.subheader("Research-engine portfolio")
 
     holdings = portfolio.get("holdings", {})
 
     if holdings:
         hrows = []
-
         for name, holding in holdings.items():
             hrows.append(
                 {
                     "Fund": name,
-                    "Current value": holding.get(
-                        "current_value"
-                    ),
-                    "Invested": holding.get(
-                        "invested_value"
-                    ),
+                    "Current value": holding.get("current_value"),
+                    "Invested": holding.get("invested_value"),
                     "P&L": holding.get("pnl"),
                     "P&L %": holding.get("pnl_pct"),
                 }
@@ -1275,7 +1364,10 @@ with tab_portfolio:
             use_container_width=True,
         )
     else:
-        st.info("No holdings file was loaded.")
+        st.info(
+            "The research result contains no holdings. "
+            "This does not prevent the live Zerodha holdings above from being shown."
+        )
 
     st.subheader("Existing exposure")
 
