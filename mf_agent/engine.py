@@ -68,7 +68,7 @@ class ResearchEngine:
                 "scenario_analysis": scenario_matrix(fund, regime),
             })
 
-        # Local retrieval layer: numerical ranking first, then lightweight vector
+        # Local retrieval layer: numerical ranking first, then persistent on-disk vector
         # retrieval. Only this compact evidence set is intended for the LLM.
         ranked_for_review = rank_candidates(evaluated, self.settings.ranking_limit)
         diversified_for_review = diversify_shortlist(ranked_for_review, min(self.settings.ranking_limit, 30))
@@ -82,8 +82,11 @@ class ResearchEngine:
                 },
             },
             self.settings.vector_limit,
+            self.settings.vector_store_dir,
         )
-        relevant_news = retrieve_relevant_news(news, llm_candidates, self.settings.news_vector_limit)
+        relevant_news = retrieve_relevant_news(
+            news, llm_candidates, self.settings.news_vector_limit, self.settings.vector_store_dir
+        )
 
         return {
             "engine_version": "2.2.0",
@@ -113,6 +116,7 @@ class ResearchEngine:
                 "ranked_limit": self.settings.ranking_limit,
                 "vector_limit": self.settings.vector_limit,
                 "news_vector_limit": self.settings.news_vector_limit,
+                "vector_store_dir": self.settings.vector_store_dir,
                 "ranked_funds": ranked_for_review,
                 "diversified_funds": diversified_for_review,
                 "llm_candidates": llm_candidates,

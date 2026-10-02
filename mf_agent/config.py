@@ -53,6 +53,7 @@ class Settings:
     ranking_limit: int = 50
     vector_limit: int = 15
     news_vector_limit: int = 10
+    vector_store_dir: str = "vector_store"
     inter_batch_delay_sec: float = 3.0
     min_aum_inr_cr: float = 500.0
     min_history_years: float = 3.0
@@ -121,6 +122,7 @@ def load_settings() -> Settings:
         ranking_limit=_int("LOCAL_RANKING_LIMIT", 50),
         vector_limit=_int("VECTOR_RETRIEVAL_LIMIT", 15),
         news_vector_limit=_int("NEWS_VECTOR_RETRIEVAL_LIMIT", 10),
+        vector_store_dir=os.getenv("VECTOR_STORE_DIR", "vector_store"),
         inter_batch_delay_sec=_float("INTER_BATCH_DELAY_SEC", 3.0),
         min_aum_inr_cr=_float("MIN_AUM_INR_CR", 500.0),
         min_history_years=_float("MIN_HISTORY_YEARS", 3.0),
