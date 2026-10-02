@@ -40,7 +40,6 @@ ENV/
 
 # Logs
 *.log
-logs/
 
 *.json
 
