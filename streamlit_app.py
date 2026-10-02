@@ -6,9 +6,8 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+
 from dotenv import load_dotenv
-
-
 import pandas as pd
 import streamlit as st
 
@@ -20,6 +19,7 @@ from mf_agent.zerodha import (
 )
 
 ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env")
 
 OUTPUT_PATH = ROOT / os.getenv(
     "MF_SUGGESTION_OUTPUT_PATH",
@@ -28,11 +28,8 @@ OUTPUT_PATH = ROOT / os.getenv(
 
 LOG_DIR = ROOT / "logs"
 CURRENT_LOG_PATH = LOG_DIR / "mf_agent_latest.log"
-
 LOG_DIR.mkdir(exist_ok=True)
 
-
-load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Streamlit session state
@@ -58,7 +55,7 @@ if "zerodha_user_id" not in st.session_state:
 
 
 # ---------------------------------------------------------------------------
-# Investor profile helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 def current_investor_inputs():
@@ -70,68 +67,38 @@ def current_investor_inputs():
             st.session_state.get("investor_age", 38)
         ),
         "horizon": st.session_state.get(
-            "horizon",
-            "LONG_TERM",
+            "horizon", "LONG_TERM"
         ),
         "allocation_mode": st.session_state.get(
-            "allocation_mode",
-            "DIVERSIFIED",
+            "allocation_mode", "DIVERSIFIED"
         ),
     }
 
 
 def mark_result_stale():
-    current = current_investor_inputs()
-
-    applied = st.session_state.get(
-        "investor_inputs_applied"
-    )
-
+    applied = st.session_state.get("investor_inputs_applied")
     if applied is None:
         return False
-
-    return current != applied
-
-
-# ---------------------------------------------------------------------------
-# Page configuration
-# ---------------------------------------------------------------------------
-
-st.set_page_config(
-    page_title="Mutual Fund Research Dashboard",
-    page_icon="📊",
-    layout="wide",
-)
+    return current_investor_inputs() != applied
 
 
-# ---------------------------------------------------------------------------
-# Formatting helpers
-# ---------------------------------------------------------------------------
-
-def money(x):
-    if x is None:
+def money(value):
+    if value is None:
         return "—"
+    return f"₹{value:,.0f}"
 
-    return f"₹{x:,.0f}"
 
-
-def pct(x):
-    if x is None:
+def pct(value):
+    if value is None:
         return "—"
+    return f"{value:.1f}%"
 
-    return f"{x:.1f}%"
 
-
-def score_fmt(x):
-    if x is None:
+def score_fmt(value):
+    if value is None:
         return "—"
+    return f"{value:.1f}"
 
-    return f"{x:.1f}"
-
-
-# ---------------------------------------------------------------------------
-# Analysis result helpers
-# ---------------------------------------------------------------------------
 
 def load_result():
     if not OUTPUT_PATH.exists():
@@ -139,33 +106,28 @@ def load_result():
 
     try:
         return json.loads(
-            OUTPUT_PATH.read_text(
-                encoding="utf-8"
-            )
+            OUTPUT_PATH.read_text(encoding="utf-8")
         )
-
     except Exception as exc:
         st.error(
             f"Could not read {OUTPUT_PATH.name}: {exc}"
         )
-
         return None
 
 
 # ---------------------------------------------------------------------------
-# Zerodha helpers
+# Zerodha
 # ---------------------------------------------------------------------------
 
 def zerodha_holdings_path():
     """
-    Resolve the holdings file used by the existing application.
+    Resolve the holdings file used by the research engine.
 
-    The engine normally gets this from settings.mf_holdings_path.
-    Keep the environment override available so deployments can customize it.
+    Keep this aligned with config.py, which uses
+    MF_HOLDINGS_JSON_PATH.
     """
-
     configured_path = os.getenv(
-        "MF_HOLDINGS_PATH",
+        "MF_HOLDINGS_JSON_PATH",
         "mf_holdings.json",
     )
 
@@ -179,19 +141,12 @@ def zerodha_holdings_path():
 
 def handle_zerodha_callback():
     """
-    Process Zerodha OAuth callback.
+    Process the Zerodha OAuth callback.
 
-    Zerodha redirects to the configured redirect URL with:
-
+    Zerodha redirects to the configured callback with:
         ?request_token=...
-
-    The request token is exchanged for an access token and current
-    mutual fund holdings are imported.
     """
-
-    request_token = st.query_params.get(
-        "request_token"
-    )
+    request_token = st.query_params.get("request_token")
 
     if not request_token:
         return
@@ -204,96 +159,64 @@ def handle_zerodha_callback():
             path=str(holdings_path),
         )
 
-        access_token = result.get(
-            "access_token"
-        )
+        access_token = result.get("access_token")
 
         if not access_token:
             raise RuntimeError(
                 "Zerodha login succeeded but no access token was returned."
             )
 
-        st.session_state.zerodha_access_token = (
-            access_token
+        st.session_state.zerodha_access_token = access_token
+        st.session_state.zerodha_user_name = result.get("user_name")
+        st.session_state.zerodha_user_id = result.get("user_id")
+        st.session_state.zerodha_last_holdings_count = result.get(
+            "holdings_count", 0
         )
-
-        st.session_state.zerodha_user_name = (
-            result.get("user_name")
+        st.session_state.zerodha_last_sync = datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
         )
-
-        st.session_state.zerodha_user_id = (
-            result.get("user_id")
-        )
-
-        st.session_state.zerodha_last_holdings_count = (
-            result.get("holdings_count", 0)
-        )
-
-        st.session_state.zerodha_last_sync = (
-            datetime.now().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-        )
-
         st.session_state.zerodha_sync_message = (
             f"Imported {result.get('holdings_count', 0)} "
-            f"mutual fund holdings."
+            "mutual fund holdings."
         )
 
-        # Remove request_token from browser URL.
         st.query_params.clear()
 
         st.success(
             "Zerodha connected successfully. "
             f"Imported {result.get('holdings_count', 0)} MF holdings."
         )
-
         st.rerun()
 
     except Exception as exc:
-        st.error(
-            f"Zerodha authentication failed: {exc}"
-        )
-
+        st.error(f"Zerodha authentication failed: {exc}")
         st.info(
-            "Check your Zerodha API key, API secret, "
-            "redirect URL, and Kite Connect application configuration."
+            "Check your Zerodha API key, API secret, redirect URL, "
+            "and Kite Connect application configuration."
         )
 
 
 def refresh_zerodha_holdings():
     """
-    Fetch latest MF holdings using the current Streamlit-session
-    Zerodha access token.
+    Fetch the latest MF holdings using the access token stored
+    in the current Streamlit session.
     """
-
-    access_token = st.session_state.get(
-        "zerodha_access_token"
-    )
+    access_token = st.session_state.get("zerodha_access_token")
 
     if not access_token:
-        st.warning(
-            "Connect Zerodha first."
-        )
-
+        st.warning("Connect Zerodha first.")
         return False
 
     holdings_path = zerodha_holdings_path()
 
     try:
-        holdings = fetch_mf_holdings(
-            access_token
-        )
+        holdings = fetch_mf_holdings(access_token)
 
-        # Safety guard:
-        # Never overwrite the existing holdings file if Zerodha unexpectedly
-        # returns zero holdings.
         if not holdings:
             st.warning(
                 "Zerodha returned zero MF holdings. "
                 "Existing holdings were not overwritten."
             )
-
             return False
 
         save_holdings(
@@ -301,16 +224,10 @@ def refresh_zerodha_holdings():
             str(holdings_path),
         )
 
-        st.session_state.zerodha_last_holdings_count = (
-            len(holdings)
+        st.session_state.zerodha_last_holdings_count = len(holdings)
+        st.session_state.zerodha_last_sync = datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
         )
-
-        st.session_state.zerodha_last_sync = (
-            datetime.now().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-        )
-
         st.session_state.zerodha_sync_message = (
             f"Refreshed {len(holdings)} mutual fund holdings."
         )
@@ -318,24 +235,17 @@ def refresh_zerodha_holdings():
         return True
 
     except Exception as exc:
-        error_text = str(exc)
-
         st.error(
-            f"Could not refresh Zerodha holdings: {error_text}"
+            f"Could not refresh Zerodha holdings: {exc}"
         )
-
         st.info(
             "If your Zerodha session has expired, "
             "use Connect Zerodha again."
         )
-
         return False
 
 
-# ---------------------------------------------------------------------------
-# Process Zerodha OAuth callback before rendering sidebar
-# ---------------------------------------------------------------------------
-
+# Process OAuth callback before rendering the sidebar.
 handle_zerodha_callback()
 
 
@@ -344,60 +254,45 @@ handle_zerodha_callback()
 # ---------------------------------------------------------------------------
 
 def apply_env_from_sidebar():
-    os.environ["MF_HORIZON"] = (
-        st.session_state.horizon
-    )
-
+    os.environ["MF_HORIZON"] = st.session_state.horizon
     os.environ["MF_INVESTMENT_AMOUNT"] = str(
         st.session_state.investment_amount
     )
-
     os.environ["INVESTOR_AGE"] = str(
         st.session_state.investor_age
     )
-
     os.environ["ALLOCATION_MODE"] = (
         st.session_state.allocation_mode
     )
-
     os.environ["ENABLE_LLM_REVIEW"] = (
         "true"
         if st.session_state.llm_review
         else "false"
     )
-
     os.environ["MAX_CATEGORY_EXPOSURE_PCT"] = str(
         st.session_state.max_category
     )
-
     os.environ["MAX_SINGLE_FUND_PCT"] = str(
         st.session_state.max_fund
     )
-
     os.environ["MAX_SINGLE_AMC_PCT"] = str(
         st.session_state.max_amc
     )
-
     os.environ["MAX_MID_CAP_PCT"] = str(
         st.session_state.max_mid
     )
-
     os.environ["MAX_SMALL_CAP_PCT"] = str(
         st.session_state.max_small
     )
-
     os.environ["MAX_THEMATIC_PCT"] = str(
         st.session_state.max_thematic
     )
-
     os.environ["MIN_CASH_PCT"] = str(
         st.session_state.min_cash
     )
-
     os.environ["MAX_GOLD_PCT"] = str(
         st.session_state.max_gold
     )
-
     os.environ["MAX_FUND_OVERLAP_PCT"] = str(
         st.session_state.max_overlap
     )
@@ -411,13 +306,11 @@ def run_engine():
     apply_env_from_sidebar()
 
     env = os.environ.copy()
-
     env["PYTHONPATH"] = (
         str(ROOT)
         + os.pathsep
         + env.get("PYTHONPATH", "")
     )
-
     env["PYTHONUNBUFFERED"] = "1"
 
     cmd = [
@@ -427,14 +320,12 @@ def run_engine():
     ]
 
     log_lines = []
-
     log_placeholder = st.empty()
 
     with st.status(
         "Running mutual-fund research engine…",
         expanded=True,
     ) as status:
-
         st.caption("Live engine log")
 
         proc = subprocess.Popen(
@@ -465,14 +356,16 @@ def run_engine():
 
         return_code = proc.wait()
 
-        st.session_state.engine_logs = list(
-            log_lines
-        )
+        st.session_state.engine_logs = list(log_lines)
 
         try:
-            CURRENT_LOG_PATH.write_text(
+            log_text = (
                 "\n".join(log_lines)
-                + ("\n" if log_lines else ""),
+                + ("\n" if log_lines else "")
+            )
+
+            CURRENT_LOG_PATH.write_text(
+                log_text,
                 encoding="utf-8",
             )
 
@@ -482,18 +375,14 @@ def run_engine():
             )
 
             history_path.write_text(
-                "\n".join(log_lines)
-                + ("\n" if log_lines else ""),
+                log_text,
                 encoding="utf-8",
             )
 
-            st.session_state.engine_log_path = (
-                str(history_path)
-            )
+            st.session_state.engine_log_path = str(history_path)
 
         except OSError as exc:
             st.session_state.engine_log_path = None
-
             st.warning(
                 f"Could not persist engine log to disk: {exc}"
             )
@@ -503,13 +392,10 @@ def run_engine():
                 label="Analysis failed",
                 state="error",
             )
-
             st.error(
-                f"Research engine exited with code "
-                f"{return_code}. "
-                f"See Diagnostics → Engine log."
+                f"Research engine exited with code {return_code}. "
+                "See Diagnostics → Engine log."
             )
-
             return None
 
         status.update(
@@ -521,12 +407,16 @@ def run_engine():
 
 
 # ---------------------------------------------------------------------------
-# Header
+# Page
 # ---------------------------------------------------------------------------
 
-st.title(
-    "📊 Mutual Fund Research Dashboard"
+st.set_page_config(
+    page_title="Mutual Fund Research Dashboard",
+    page_icon="📊",
+    layout="wide",
 )
+
+st.title("📊 Mutual Fund Research Dashboard")
 
 st.caption(
     "Regime-aware quantitative research with constrained "
@@ -539,7 +429,6 @@ st.caption(
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
-
     st.header("Investor profile")
 
     st.number_input(
@@ -580,19 +469,13 @@ with st.sidebar:
 
     st.selectbox(
         "Investment horizon",
-        [
-            "LONG_TERM",
-            "SHORT_TERM",
-        ],
+        ["LONG_TERM", "SHORT_TERM"],
         key="horizon",
     )
 
     st.selectbox(
         "Allocation mode",
-        [
-            "DIVERSIFIED",
-            "CONCENTRATED",
-        ],
+        ["DIVERSIFIED", "CONCENTRATED"],
         key="allocation_mode",
     )
 
@@ -609,11 +492,10 @@ with st.sidebar:
     )
 
     # -----------------------------------------------------------------------
-    # Zerodha section
+    # Zerodha
     # -----------------------------------------------------------------------
 
     st.divider()
-
     st.header("Zerodha")
 
     zerodha_token = st.session_state.get(
@@ -621,58 +503,37 @@ with st.sidebar:
     )
 
     if zerodha_token:
+        st.success("Connected")
 
-        st.success(
-            "Connected"
-        )
-
-        user_name = st.session_state.get(
-            "zerodha_user_name"
-        )
-
-        user_id = st.session_state.get(
-            "zerodha_user_id"
-        )
+        user_name = st.session_state.get("zerodha_user_name")
+        user_id = st.session_state.get("zerodha_user_id")
 
         if user_name:
-            st.caption(
-                f"User: {user_name}"
-            )
+            st.caption(f"User: {user_name}")
 
         if user_id:
-            st.caption(
-                f"User ID: {user_id}"
-            )
+            st.caption(f"User ID: {user_id}")
 
         holdings_count = st.session_state.get(
             "zerodha_last_holdings_count"
         )
 
         if holdings_count is not None:
-            st.caption(
-                f"MF holdings: {holdings_count}"
-            )
+            st.caption(f"MF holdings: {holdings_count}")
 
-        last_sync = st.session_state.get(
-            "zerodha_last_sync"
-        )
+        last_sync = st.session_state.get("zerodha_last_sync")
 
         if last_sync:
-            st.caption(
-                f"Last sync: {last_sync}"
-            )
+            st.caption(f"Last sync: {last_sync}")
 
         if st.button(
             "↻ Refresh MF holdings",
             use_container_width=True,
         ):
-
             with st.spinner(
                 "Fetching MF holdings from Zerodha..."
             ):
-                refreshed = (
-                    refresh_zerodha_holdings()
-                )
+                refreshed = refresh_zerodha_holdings()
 
             if refreshed:
                 st.success(
@@ -682,16 +543,36 @@ with st.sidebar:
                     )
                 )
 
-                # Reload the dashboard result because the underlying
-                # holdings file has changed.
-                st.session_state.result = (
-                    load_result()
-                )
+                # IMPORTANT:
+                # mf_holdings.json has changed. Do not call load_result()
+                # here because that only reads the previous analysis JSON.
+                # Re-run the complete research engine instead.
+                previous_result = st.session_state.get("result")
+
+                with st.spinner(
+                    "Rebuilding portfolio analysis from refreshed holdings..."
+                ):
+                    rebuilt_result = run_engine()
+
+                if rebuilt_result:
+                    st.session_state.result = rebuilt_result
+                    st.session_state.investor_inputs_applied = (
+                        current_investor_inputs()
+                    )
+                    st.success(
+                        "Portfolio analysis rebuilt using the latest "
+                        "Zerodha holdings."
+                    )
+                else:
+                    st.session_state.result = previous_result
+                    st.error(
+                        "Portfolio analysis rebuild failed. "
+                        "The previous dashboard result was kept."
+                    )
 
                 st.rerun()
 
     else:
-
         st.info(
             "Connect your Zerodha account to import "
             "current mutual fund holdings."
@@ -707,11 +588,9 @@ with st.sidebar:
             )
 
         except Exception as exc:
-
             st.error(
                 f"Unable to generate Zerodha login URL: {exc}"
             )
-
             st.caption(
                 "Check ZERODHA_API_KEY and your Kite Connect configuration."
             )
@@ -730,7 +609,6 @@ with st.sidebar:
         "Portfolio constraints",
         expanded=False,
     ):
-
         st.number_input(
             "Max category %",
             1.0,
@@ -852,10 +730,7 @@ with st.sidebar:
     # Analysis controls
     # -----------------------------------------------------------------------
 
-    inputs_changed = mark_result_stale()
-
-    if inputs_changed:
-
+    if mark_result_stale():
         st.warning(
             "Investor inputs changed. "
             "Click **Run analysis** to recalculate the portfolio."
@@ -866,40 +741,21 @@ with st.sidebar:
         type="primary",
         use_container_width=True,
     ):
-
-        st.session_state.result = (
-            run_engine()
-        )
-
+        st.session_state.result = run_engine()
         st.session_state.investor_inputs_applied = (
             current_investor_inputs()
         )
-
         st.rerun()
 
     if st.button(
         "↻ Load latest JSON",
         use_container_width=True,
     ):
+        st.session_state.result = load_result()
 
-        st.session_state.result = (
-            load_result()
-        )
-
-        loaded = (
-            st.session_state.result
-            or {}
-        )
-
-        settings = loaded.get(
-            "settings",
-            {},
-        )
-
-        horizon_settings = settings.get(
-            "horizon",
-            {},
-        )
+        loaded = st.session_state.result or {}
+        settings = loaded.get("settings", {})
+        horizon_settings = settings.get("horizon", {})
 
         st.session_state.investor_inputs_applied = {
             "amount": float(
@@ -914,10 +770,7 @@ with st.sidebar:
                     st.session_state.investor_age,
                 )
             ),
-            "horizon": settings.get(
-                "horizon",
-                {}
-            ).get(
+            "horizon": horizon_settings.get(
                 "mode",
                 st.session_state.horizon,
             ),
@@ -940,35 +793,22 @@ latest_logs = st.session_state.get(
 )
 
 if latest_logs:
-
     with st.expander(
         "📜 Latest engine log",
         expanded=False,
     ):
-
         st.code(
             "\n".join(latest_logs),
             language="text",
         )
 
-        log_path = st.session_state.get(
-            "engine_log_path"
-        )
+        log_path = st.session_state.get("engine_log_path")
 
-        if (
-            log_path
-            and Path(log_path).exists()
-        ):
-
+        if log_path and Path(log_path).exists():
             st.download_button(
                 "Download latest engine log",
-                data=(
-                    "\n".join(latest_logs)
-                    + "\n"
-                ),
-                file_name=Path(
-                    log_path
-                ).name,
+                data="\n".join(latest_logs) + "\n",
+                file_name=Path(log_path).name,
                 mime="text/plain",
                 key="download_latest_engine_log",
             )
@@ -983,9 +823,7 @@ result = (
     or load_result()
 )
 
-
 if not result:
-
     st.info(
         "No analysis result is available yet. "
         "Configure the controls and click **Run analysis**."
@@ -1003,40 +841,13 @@ if not result:
 # Result data
 # ---------------------------------------------------------------------------
 
-market = result.get(
-    "market",
-    {},
-)
-
-macro = market.get(
-    "macro",
-    {},
-)
-
-regime = market.get(
-    "regime",
-    {},
-)
-
-portfolio = result.get(
-    "portfolio",
-    {},
-)
-
-funds = result.get(
-    "evaluated_funds",
-    [],
-)
-
-allocation = result.get(
-    "allocation_plan",
-    [],
-)
-
-metadata = result.get(
-    "metadata",
-    {},
-)
+market = result.get("market", {})
+macro = market.get("macro", {})
+regime = market.get("regime", {})
+portfolio = result.get("portfolio", {})
+funds = result.get("evaluated_funds", [])
+allocation = result.get("allocation_plan", [])
+metadata = result.get("metadata", {})
 
 
 # ---------------------------------------------------------------------------
@@ -1058,10 +869,7 @@ c1, c2, c3, c4, c5 = st.columns(5)
 
 c1.metric(
     "Overall regime",
-    regime.get(
-        "overall",
-        "—",
-    ),
+    regime.get("overall", "—"),
 )
 
 c2.metric(
@@ -1075,26 +883,18 @@ c3.metric(
         portfolio.get(
             "funds_info",
             {},
-        ).get(
-            "deployable_cash"
-        )
+        ).get("deployable_cash")
     ),
 )
 
 c4.metric(
     "News events",
-    market.get(
-        "news_count",
-        0,
-    ),
+    market.get("news_count", 0),
 )
 
 c5.metric(
     "LLM reviews",
-    metadata.get(
-        "llm_review_count",
-        0,
-    ),
+    metadata.get("llm_review_count", 0),
 )
 
 
@@ -1119,17 +919,12 @@ profile_cols[2].metric(
     current_investor_inputs()["horizon"],
 )
 
-
-stale = mark_result_stale()
-
-if stale:
-
+if mark_result_stale():
     st.info(
-        "The investor profile shown above reflects your current dashboard inputs. "
-        "The analysis below is from the previous run. "
+        "The investor profile shown above reflects your current dashboard "
+        "inputs. The analysis below is from the previous run. "
         "Click **Run analysis** to update scores, allocation, and scenarios."
     )
-
 
 st.divider()
 
@@ -1166,10 +961,7 @@ st.divider()
 # ---------------------------------------------------------------------------
 
 with tab_overview:
-
-    st.subheader(
-        "Market regime"
-    )
+    st.subheader("Market regime")
 
     regime_cols = [
         "equity",
@@ -1185,15 +977,9 @@ with tab_overview:
 
     reg_df = pd.DataFrame(
         {
-            "Dimension": [
-                x.title()
-                for x in regime_cols
-            ],
+            "Dimension": [x.title() for x in regime_cols],
             "Regime": [
-                regime.get(
-                    x,
-                    "—",
-                )
+                regime.get(x, "—")
                 for x in regime_cols
             ],
         }
@@ -1205,60 +991,41 @@ with tab_overview:
         use_container_width=True,
     )
 
-    st.subheader(
-        "Top candidates"
-    )
+    st.subheader("Top candidates")
 
-    top = result.get(
-        "top_candidates",
-        [],
-    )
-
+    top = result.get("top_candidates", [])
     rows = []
 
-    for f in top:
-
-        s = f.get(
-            "score",
-            {},
-        )
+    for fund in top:
+        score = fund.get("score", {})
 
         rows.append(
             {
-                "Fund": f["scheme_name"],
-                "Category": f.get("category"),
-                "AMC": f.get("amc"),
-                "Action": f.get(
+                "Fund": fund["scheme_name"],
+                "Category": fund.get("category"),
+                "AMC": fund.get("amc"),
+                "Action": fund.get(
                     "final_action",
-                    f.get("action"),
+                    fund.get("action"),
                 ),
                 "Score": round(
-                    s.get(
-                        "overall",
-                        0,
-                    ),
+                    score.get("overall", 0),
                     1,
                 ),
                 "Fit": (
                     round(
-                        s["portfolio_fit"],
+                        score["portfolio_fit"],
                         1,
                     )
-                    if s.get(
-                        "portfolio_fit"
-                    )
-                    is not None
+                    if score.get("portfolio_fit") is not None
                     else None
                 ),
                 "Macro resilience": (
                     round(
-                        s["macro_resilience"],
+                        score["macro_resilience"],
                         1,
                     )
-                    if s.get(
-                        "macro_resilience"
-                    )
-                    is not None
+                    if score.get("macro_resilience") is not None
                     else None
                 ),
             }
@@ -1270,20 +1037,15 @@ with tab_overview:
         use_container_width=True,
     )
 
-    st.subheader(
-        "Allocation plan"
-    )
+    st.subheader("Allocation plan")
 
     if allocation:
-
         st.dataframe(
             pd.DataFrame(allocation),
             hide_index=True,
             use_container_width=True,
         )
-
     else:
-
         st.info(
             "No new allocation passed the current "
             "score and portfolio constraints."
@@ -1295,67 +1057,48 @@ with tab_overview:
 # ---------------------------------------------------------------------------
 
 with tab_funds:
-
-    st.subheader(
-        "Fund ranking"
-    )
+    st.subheader("Fund ranking")
 
     rows = []
 
-    for f in funds:
-
-        s = f.get(
-            "score",
-            {},
-        )
-
-        m = f.get(
-            "fund_metrics",
-            {},
-        )
+    for fund in funds:
+        score = fund.get("score", {})
+        metrics = fund.get("fund_metrics", {})
 
         rows.append(
             {
-                "Fund": f["scheme_name"],
-                "Category": f.get("category"),
-                "AMC": f.get("amc"),
-                "Action": f.get(
+                "Fund": fund["scheme_name"],
+                "Category": fund.get("category"),
+                "AMC": fund.get("amc"),
+                "Action": fund.get(
                     "final_action",
-                    f.get("action"),
+                    fund.get("action"),
                 ),
-                "Overall": s.get("overall"),
-                "Quality": s.get("fund_quality"),
-                "Risk-adjusted": s.get(
+                "Overall": score.get("overall"),
+                "Quality": score.get("fund_quality"),
+                "Risk-adjusted": score.get(
                     "risk_adjusted_return"
                 ),
-                "Attractiveness": s.get(
+                "Attractiveness": score.get(
                     "current_attractiveness"
                 ),
-                "Portfolio fit": s.get(
+                "Portfolio fit": score.get(
                     "portfolio_fit"
                 ),
-                "Valuation": s.get(
-                    "valuation"
-                ),
-                "Macro resilience": s.get(
+                "Valuation": score.get("valuation"),
+                "Macro resilience": score.get(
                     "macro_resilience"
                 ),
-                "Data confidence": s.get(
+                "Data confidence": score.get(
                     "data_confidence"
                 ),
-                "Ranking score": s.get(
+                "Ranking score": score.get(
                     "ranking_score"
                 ),
-                "1Y CAGR": m.get(
-                    "cagr_1y_pct"
-                ),
-                "3Y CAGR": m.get(
-                    "cagr_3y_pct"
-                ),
-                "5Y CAGR": m.get(
-                    "cagr_5y_pct"
-                ),
-                "Drawdown": m.get(
+                "1Y CAGR": metrics.get("cagr_1y_pct"),
+                "3Y CAGR": metrics.get("cagr_3y_pct"),
+                "5Y CAGR": metrics.get("cagr_5y_pct"),
+                "Drawdown": metrics.get(
                     "max_drawdown_pct"
                 ),
             }
@@ -1387,25 +1130,20 @@ with tab_funds:
     )
 
     if df.empty:
-
         st.warning(
             "No evaluated funds are available in the current analysis. "
             "Check the engine output/log above, fund data source, "
             "or network connectivity."
         )
-
     else:
-
         df["Overall"] = pd.to_numeric(
             df["Overall"],
             errors="coerce",
         )
-
         df["Ranking score"] = pd.to_numeric(
             df["Ranking score"],
             errors="coerce",
         )
-
         df = df.sort_values(
             "Ranking score",
             ascending=False,
@@ -1425,126 +1163,82 @@ with tab_funds:
     )
 
     names = [
-        x["scheme_name"]
-        for x in funds
+        fund["scheme_name"]
+        for fund in funds
     ]
 
     if names:
-
         selected = st.selectbox(
             "Inspect fund",
             names,
         )
 
         fund = next(
-            x
-            for x in funds
-            if x["scheme_name"] == selected
+            item
+            for item in funds
+            if item["scheme_name"] == selected
         )
 
-        s = fund.get(
-            "score",
-            {},
-        )
-
-        m = fund.get(
-            "fund_metrics",
-            {},
-        )
+        score = fund.get("score", {})
+        metrics = fund.get("fund_metrics", {})
 
         a, b, c, d = st.columns(4)
 
         a.metric(
             "Overall score",
-            score_fmt(
-                s.get("overall")
-            ),
+            score_fmt(score.get("overall")),
         )
 
         b.metric(
             "Action",
             fund.get(
                 "final_action",
-                fund.get(
-                    "action",
-                    "—",
-                ),
+                fund.get("action", "—"),
             ),
         )
 
         c.metric(
             "1Y CAGR",
-            pct(
-                m.get(
-                    "cagr_1y_pct"
-                )
-            ),
+            pct(metrics.get("cagr_1y_pct")),
         )
 
         d.metric(
             "Max drawdown",
-            pct(
-                m.get(
-                    "max_drawdown_pct"
-                )
-            ),
+            pct(metrics.get("max_drawdown_pct")),
         )
 
         left, right = st.columns(2)
 
         with left:
+            st.write("**Reasons to buy**")
 
-            st.write(
-                "**Reasons to buy**"
-            )
-
-            for x in s.get(
+            for item in score.get(
                 "reasons_to_buy",
                 [],
             ):
+                st.write("•", item)
 
-                st.write(
-                    "•",
-                    x,
-                )
+            st.write("**Data warnings**")
 
-            st.write(
-                "**Data warnings**"
-            )
-
-            for x in s.get(
+            for item in score.get(
                 "data_warnings",
                 [],
             ):
-
-                st.warning(x)
+                st.warning(item)
 
         with right:
+            st.write("**Reasons not to buy**")
 
-            st.write(
-                "**Reasons not to buy**"
-            )
-
-            for x in s.get(
+            for item in score.get(
                 "reasons_not_to_buy",
                 [],
             ):
+                st.write("•", item)
 
-                st.write(
-                    "•",
-                    x,
-                )
-
-            review = fund.get(
-                "llm_review"
-            )
+            review = fund.get("llm_review")
 
             if review:
-
-                st.write(
-                    "**LLM challenge review**"
-                )
-
+                st.write("**LLM challenge review**")
                 st.json(review)
 
 
@@ -1553,37 +1247,25 @@ with tab_funds:
 # ---------------------------------------------------------------------------
 
 with tab_portfolio:
+    st.subheader("Current holdings")
 
-    st.subheader(
-        "Current holdings"
-    )
-
-    holdings = portfolio.get(
-        "holdings",
-        {},
-    )
+    holdings = portfolio.get("holdings", {})
 
     if holdings:
-
         hrows = []
 
-        for name, h in holdings.items():
-
+        for name, holding in holdings.items():
             hrows.append(
                 {
                     "Fund": name,
-                    "Current value": h.get(
+                    "Current value": holding.get(
                         "current_value"
                     ),
-                    "Invested": h.get(
+                    "Invested": holding.get(
                         "invested_value"
                     ),
-                    "P&L": h.get(
-                        "pnl"
-                    ),
-                    "P&L %": h.get(
-                        "pnl_pct"
-                    ),
+                    "P&L": holding.get("pnl"),
+                    "P&L %": holding.get("pnl_pct"),
                 }
             )
 
@@ -1592,16 +1274,10 @@ with tab_portfolio:
             hide_index=True,
             use_container_width=True,
         )
-
     else:
+        st.info("No holdings file was loaded.")
 
-        st.info(
-            "No holdings file was loaded."
-        )
-
-    st.subheader(
-        "Existing exposure"
-    )
+    st.subheader("Existing exposure")
 
     exposure = portfolio.get(
         "existing_exposure",
@@ -1609,34 +1285,27 @@ with tab_portfolio:
     )
 
     if exposure:
-
         for key, value in exposure.items():
-
             st.write(
                 f"**{key.replace('_', ' ').title()}**"
             )
 
-            if isinstance(
-                value,
-                dict,
-            ):
-
+            if isinstance(value, dict):
                 st.dataframe(
                     pd.DataFrame(
                         [
                             {
-                                "Name": k,
-                                "Exposure %": v,
+                                "Name": name,
+                                "Exposure %": exposure_value,
                             }
-                            for k, v in value.items()
+                            for name, exposure_value
+                            in value.items()
                         ]
                     ),
                     hide_index=True,
                     use_container_width=True,
                 )
-
             else:
-
                 st.write(value)
 
 
@@ -1645,42 +1314,25 @@ with tab_portfolio:
 # ---------------------------------------------------------------------------
 
 with tab_macro:
-
-    st.subheader(
-        "Macro snapshot"
-    )
+    st.subheader("Macro snapshot")
 
     macro_rows = {
-        "USD/INR": macro.get(
-            "usd_inr"
-        ),
-        "Brent crude": macro.get(
-            "brent_crude_usd"
-        ),
-        "India VIX": macro.get(
-            "india_vix"
-        ),
+        "USD/INR": macro.get("usd_inr"),
+        "Brent crude": macro.get("brent_crude_usd"),
+        "India VIX": macro.get("india_vix"),
         "India 10Y yield": macro.get(
             "india_10y_yield_pct"
         ),
-        "Nifty 50": macro.get(
-            "nifty_50"
-        ),
-        "Nifty Midcap": macro.get(
-            "nifty_midcap"
-        ),
+        "Nifty 50": macro.get("nifty_50"),
+        "Nifty Midcap": macro.get("nifty_midcap"),
         "Nifty Smallcap": macro.get(
             "nifty_smallcap"
         ),
-        "Gold": macro.get(
-            "gold_usd"
-        ),
+        "Gold": macro.get("gold_usd"),
         "US 10Y yield": macro.get(
             "us_10y_yield_pct"
         ),
-        "S&P 500": macro.get(
-            "sp500"
-        ),
+        "S&P 500": macro.get("sp500"),
         "Crude 1M change": macro.get(
             "crude_change_1m_pct"
         ),
@@ -1690,38 +1342,29 @@ with tab_macro:
         "VIX 1M change": macro.get(
             "india_vix_change_1m_pct"
         ),
-        "Inflation": macro.get(
-            "inflation_pct"
-        ),
-        "Repo rate": macro.get(
-            "repo_rate_pct"
-        ),
+        "Inflation": macro.get("inflation_pct"),
+        "Repo rate": macro.get("repo_rate_pct"),
     }
 
     st.dataframe(
         pd.DataFrame(
             [
                 {
-                    "Indicator": k,
-                    "Value": v,
+                    "Indicator": key,
+                    "Value": value,
                 }
-                for k, v in macro_rows.items()
+                for key, value in macro_rows.items()
             ]
         ),
         hide_index=True,
         use_container_width=True,
     )
 
-    st.subheader(
-        "Regime signals"
-    )
+    st.subheader("Regime signals")
 
     st.dataframe(
         pd.DataFrame(
-            regime.get(
-                "signals",
-                [],
-            )
+            regime.get("signals", [])
         ),
         hide_index=True,
         use_container_width=True,
@@ -1733,19 +1376,13 @@ with tab_macro:
 # ---------------------------------------------------------------------------
 
 with tab_scenarios:
-
-    st.subheader(
-        "Scenario resilience"
-    )
+    st.subheader("Scenario resilience")
 
     scenario_rows = []
 
-    for f in funds:
-
+    for fund in funds:
         scenario_data = (
-            f.get(
-                "scenario_analysis"
-            )
+            fund.get("scenario_analysis")
             or []
         )
 
@@ -1753,39 +1390,29 @@ with tab_scenarios:
             scenario_data,
             list,
         ):
-
             for details in scenario_data:
-
-                if not isinstance(
-                    details,
-                    dict,
-                ):
+                if not isinstance(details, dict):
                     continue
 
                 scenario = (
-                    details.get(
-                        "scenario"
-                    )
+                    details.get("scenario")
                     or {}
                 )
 
-                scenario_name = (
-                    scenario.get(
+                if isinstance(
+                    scenario,
+                    dict,
+                ):
+                    scenario_name = scenario.get(
                         "name",
                         "Unknown",
                     )
-                    if isinstance(
-                        scenario,
-                        dict,
-                    )
-                    else str(scenario)
-                )
+                else:
+                    scenario_name = str(scenario)
 
                 scenario_rows.append(
                     {
-                        "Fund": f[
-                            "scheme_name"
-                        ],
+                        "Fund": fund["scheme_name"],
                         "Scenario": scenario_name,
                         "Resilience": details.get(
                             "resilience_score"
@@ -1806,39 +1433,24 @@ with tab_scenarios:
             scenario_data,
             dict,
         ):
-
-            for scenario, details in (
-                scenario_data.items()
-            ):
-
-                if isinstance(
-                    details,
-                    dict,
-                ):
-
+            for scenario, details in scenario_data.items():
+                if isinstance(details, dict):
                     scenario_rows.append(
                         {
-                            "Fund": f[
-                                "scheme_name"
-                            ],
+                            "Fund": fund["scheme_name"],
                             "Scenario": scenario,
                             **details,
                         }
                     )
 
     if scenario_rows:
-
         st.dataframe(
-            pd.DataFrame(
-                scenario_rows
-            ),
+            pd.DataFrame(scenario_rows),
             hide_index=True,
             use_container_width=True,
             height=600,
         )
-
     else:
-
         st.info(
             "Scenario data is not available in this result."
         )
@@ -1849,30 +1461,19 @@ with tab_scenarios:
 # ---------------------------------------------------------------------------
 
 with tab_news:
+    st.subheader("Structured news events")
 
-    st.subheader(
-        "Structured news events"
-    )
-
-    events = market.get(
-        "news_events",
-        [],
-    )
+    events = market.get("news_events", [])
 
     if events:
-
         st.dataframe(
             pd.DataFrame(events),
             hide_index=True,
             use_container_width=True,
             height=600,
         )
-
     else:
-
-        st.info(
-            "No news events were returned."
-        )
+        st.info("No news events were returned.")
 
 
 # ---------------------------------------------------------------------------
@@ -1880,12 +1481,9 @@ with tab_news:
 # ---------------------------------------------------------------------------
 
 with tab_diag:
+    st.subheader("Local research pipeline")
 
-    st.subheader(
-        "Local research pipeline"
-    )
-
-    lr = result.get(
+    local_ranking = result.get(
         "local_ranking",
         {},
     )
@@ -1894,7 +1492,7 @@ with tab_diag:
 
     c1.metric(
         "Evaluated funds",
-        lr.get(
+        local_ranking.get(
             "input_funds",
             len(funds),
         ),
@@ -1902,7 +1500,7 @@ with tab_diag:
 
     c2.metric(
         "Quant top-N",
-        lr.get(
+        local_ranking.get(
             "ranked_limit",
             "—",
         ),
@@ -1910,7 +1508,7 @@ with tab_diag:
 
     c3.metric(
         "Vector shortlist",
-        lr.get(
+        local_ranking.get(
             "vector_limit",
             "—",
         ),
@@ -1919,7 +1517,7 @@ with tab_diag:
     c4.metric(
         "LLM candidates",
         len(
-            lr.get(
+            local_ranking.get(
                 "llm_candidates",
                 [],
             )
@@ -1928,7 +1526,7 @@ with tab_diag:
 
     st.json(
         {
-            "data_confidence": lr.get(
+            "data_confidence": local_ranking.get(
                 "data_confidence",
                 {},
             ),
@@ -1941,9 +1539,7 @@ with tab_diag:
         }
     )
 
-    st.subheader(
-        "Data pipeline diagnostics"
-    )
+    st.subheader("Data pipeline diagnostics")
 
     st.caption(
         "This view is intentionally verbose so an empty fund universe "
@@ -1959,60 +1555,47 @@ with tab_diag:
         not logs
         and CURRENT_LOG_PATH.exists()
     ):
-
         try:
-
             logs = (
                 CURRENT_LOG_PATH.read_text(
                     encoding="utf-8"
                 ).splitlines()
             )
-
             st.session_state.engine_logs = logs
-
         except OSError:
-
             logs = []
 
     if logs:
-
         st.code(
             "\n".join(logs),
             language="text",
         )
-
     else:
-
         st.info(
             "No engine log is available for this session. "
             "Run the analysis once."
         )
 
-    st.subheader(
-        "Pipeline summary"
-    )
+    st.subheader("Pipeline summary")
 
     pipeline_lines = [
-        x
-        for x in logs
+        line
+        for line in logs
         if (
-            "Universe pipeline" in x
-            or "Fund data pipeline" in x
-            or "Candidate universe" in x
-            or "AMFI catalog" in x
-            or "mftool catalog" in x
+            "Universe pipeline" in line
+            or "Fund data pipeline" in line
+            or "Candidate universe" in line
+            or "AMFI catalog" in line
+            or "mftool catalog" in line
         )
     ]
 
     if pipeline_lines:
-
         st.code(
             "\n".join(pipeline_lines),
             language="text",
         )
-
     else:
-
         st.info(
             "No pipeline summary lines were captured."
         )
@@ -2023,7 +1606,6 @@ with tab_diag:
 # ---------------------------------------------------------------------------
 
 with tab_raw:
-
     st.download_button(
         "Download analysis JSON",
         data=json.dumps(
@@ -2031,9 +1613,7 @@ with tab_raw:
             indent=2,
             ensure_ascii=False,
         ),
-        file_name=(
-            "top_mutual_funds_analysis.json"
-        ),
+        file_name="top_mutual_funds_analysis.json",
         mime="application/json",
     )
 
