@@ -1,5 +1,5 @@
 from mf_agent.analytics import holdings_overlap
-from mf_agent.data import _benchmark_from_name, _parse_amfi_catalog, _parse_nav_history, is_direct_growth_scheme
+from mf_agent.data import _benchmark_from_name, _parse_amfi_catalog, _parse_nav_history, _valid_nav_date, is_direct_growth_scheme
 from mf_agent.models import FundRecord, Holding, MacroSnapshot
 from mf_agent.regime import infer_regime
 from mf_agent.scenarios import scenario_matrix
@@ -21,6 +21,10 @@ Axis Mutual Fund
     assert _benchmark_from_name("Example Nifty Smallcap 50 Index Fund") == "Nifty Smallcap 50 TRI"
     hist = _parse_nav_history({"data": [{"date": "01-10-2026", "nav": "110"}, {"date": "30-09-2026", "nav": "109"}]})
     assert len(hist) == 2 and hist.iloc[0]["nav"] == 109
+    assert _valid_nav_date("Growth") is None
+    assert _valid_nav_date("Growth Option") is None
+    assert _valid_nav_date("01-Oct-2026") == "2026-10-01"
+    assert len(_parse_nav_history([{"Date": "01-10-2026", "NAV": "110"}, {"Date": "30-09-2026", "NAV": "109"}])) == 2
 
     a = {"HDFC Bank": 10, "Reliance Industries": 5}
     b = {"HDFC Bank": 8, "TCS": 5}

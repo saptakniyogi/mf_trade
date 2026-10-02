@@ -155,7 +155,7 @@ def build_index(
     fingerprint = _documents_fingerprint(documents)
     path = _store_path(root, collection, fingerprint)
 
-    cached = _load_persistent_index(path, documents, collection)
+    cached = _load_persistent_index(path, documents, collection) if path.exists() else None
     if cached is not None:
         return cached
 
@@ -268,13 +268,29 @@ def retrieve_relevant_news(news: list[dict], selected_funds: list[dict], top_k: 
         # pretending low similarity is meaningful evidence. Event-tagged news
         # gets a lower threshold because the deterministic classifier already
         # established a market-moving channel.
-        threshold = 0.12 if item.get("event_tags") else 0.20
+        # The upstream news filter has already established that these are
+        # market/event-relevant articles. Event-tagged articles therefore need
+        # only a weak lexical match; otherwise TF-IDF can discard valid macro
+        # events simply because the article uses different wording.
+        threshold = 0.03 if item.get("event_tags") else 0.20
         if similarity < threshold:
             continue
         item["vector_similarity"] = round(similarity, 4)
         result.append(item)
         if len(result) >= top_k:
             break
+    # If lexical similarity is too sparse, fall back to deterministic event
+    # evidence. This is preferable to sending zero news items to the LLM when
+    # the classifier has already identified market-moving channels.
+    if not result:
+        event_items = [x for x in news if x.get("event_tags") or x.get("transmission_channels")]
+        event_items.sort(key=lambda x: (len(x.get("event_tags", [])), len(x.get("transmission_channels", []))), reverse=True)
+        for item in event_items[:top_k]:
+            fallback = dict(item)
+            fallback["vector_similarity"] = 0.0
+            fallback["retrieval_method"] = "event_fallback"
+            result.append(fallback)
+
     logger.info(
         "Local news retrieval: %d articles -> %d relevant articles; cache_hit=%s",
         len(news), len(result), index.cache_hit,

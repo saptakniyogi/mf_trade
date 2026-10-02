@@ -140,11 +140,30 @@ def load_holdings(settings: Settings) -> tuple[dict[str, Holding], dict]:
 
 
 def _parse_nav_history(raw: object) -> pd.DataFrame:
-    """Normalize NAV history from mftool or compatible APIs."""
-    rows = raw.get("data", []) if isinstance(raw, dict) else []
-    if not isinstance(rows, list):
-        return pd.DataFrame()
-    df = pd.DataFrame(rows)
+    """Normalize NAV history from mftool/mfapi and tolerate schema variants."""
+    if isinstance(raw, pd.DataFrame):
+        df = raw.copy()
+    elif isinstance(raw, dict):
+        rows = raw.get("data", raw.get("history", raw.get("nav", [])))
+        if isinstance(rows, dict):
+            rows = rows.get("data", rows.get("history", []))
+        df = pd.DataFrame(rows) if isinstance(rows, list) else pd.DataFrame()
+    elif isinstance(raw, list):
+        df = pd.DataFrame(raw)
+    else:
+        df = pd.DataFrame()
+    if df.empty:
+        return df
+
+    # Normalize common casing/field aliases returned by different clients.
+    aliases = {}
+    for column in df.columns:
+        key = re.sub(r"[^a-z0-9]", "", str(column).lower())
+        if key in {"date", "navdate", "valuedate"}:
+            aliases[column] = "date"
+        elif key in {"nav", "netassetvalue", "value"}:
+            aliases[column] = "nav"
+    df = df.rename(columns=aliases)
     if not {"date", "nav"}.issubset(df.columns):
         return pd.DataFrame()
     # mftool returns DD-MM-YYYY. Some fallback sources use ISO dates.
@@ -187,22 +206,32 @@ def _historical_metrics(mf: Mftool | None, code: str) -> dict:
     except Exception as exc:
         logger.debug("mftool historical NAV failed for %s: %s", code, exc)
         raw = None
+
     df = _parse_nav_history(raw)
-    if df.empty:
-        df = _parse_nav_history(_fetch_history_fallback(code))
+
+    # Some mftool versions return enough observations for CAGR but an
+    # unexpectedly sparse series for risk statistics. In that case prefer the
+    # full public NAV mirror before calculating volatility/Sharpe/Sortino.
+    if code and (df.empty or len(df) < 30):
+        fallback = _parse_nav_history(_fetch_history_fallback(code))
+        if len(fallback) > len(df):
+            df = fallback
+
     if df.empty or len(df) < 2:
+        logger.debug("NAV history unavailable/insufficient for %s: %d observations", code, len(df))
         return {}
 
     latest = float(df.iloc[-1]["nav"])
     latest_date = df.iloc[-1]["date"]
+    first_date = df.iloc[0]["date"]
     result: dict[str, object] = {
-        "history_start_date": latest_date.date().isoformat(),
+        "history_start_date": first_date.date().isoformat(),
         "history_end_date": latest_date.date().isoformat(),
         "history_days": int(len(df)),
+        "history_years": round(max(0.0, (latest_date - first_date).days / 365.25), 2),
+        "latest_nav": latest,
+        "latest_nav_date": latest_date.date().isoformat(),
     }
-    first_date = df.iloc[0]["date"]
-    result["history_start_date"] = first_date.date().isoformat()
-    result["history_years"] = round(max(0.0, (latest_date - first_date).days / 365.25), 2)
 
     for years in (1, 3, 5):
         target = latest_date - timedelta(days=int(years * 365.25))
@@ -214,31 +243,45 @@ def _historical_metrics(mf: Mftool | None, code: str) -> dict:
             result[f"cagr_{years}y_pct"] = round(((latest / old) ** (1 / years) - 1) * 100, 2)
 
     risk_start = latest_date - timedelta(days=int(5 * 365.25))
-    risk_df = df[df["date"] >= risk_start]
+    risk_df = df[df["date"] >= risk_start].copy()
     nav = risk_df["nav"].astype(float)
-    daily_returns = nav.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
-    if len(daily_returns) >= 30:
-        daily_vol = float(daily_returns.std(ddof=1))
-        result["volatility_pct"] = float(round(daily_vol * np.sqrt(252) * 100, 2))
+    returns = nav.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+
+    # Normal daily series: annualize using 252 observations. If the source is
+    # monthly/weekly, use the observed median spacing rather than pretending
+    # sparse observations are daily. This preserves evidence quality.
+    if len(returns) >= 30:
+        deltas = risk_df["date"].diff().dt.days.dropna()
+        median_gap = float(deltas.median()) if not deltas.empty else 1.0
+        periods_per_year = 252.0 if median_gap <= 3 else (52.0 if median_gap <= 10 else 12.0)
         rf_annual = float(os.getenv("RISK_FREE_RATE_PCT", "6.0")) / 100.0
-        rf_daily = (1.0 + rf_annual) ** (1 / 252) - 1
-        excess = daily_returns - rf_daily
-        excess_std = float(excess.std(ddof=1))
-        if excess_std > 1e-6 and daily_vol > 1e-6:
-            sharpe = float(excess.mean() / excess_std * np.sqrt(252))
-            if -10.0 <= sharpe <= 10.0:
-                result["sharpe"] = round(sharpe, 3)
-        downside = excess[excess < 0]
-        downside_std = float(downside.std(ddof=1)) if len(downside) > 1 else 0.0
-        if downside_std > 1e-6:
-            sortino = float(excess.mean() / downside_std * np.sqrt(252))
-            if -15.0 <= sortino <= 15.0:
-                result["sortino"] = round(sortino, 3)
+        rf_period = (1.0 + rf_annual) ** (1.0 / periods_per_year) - 1.0
+        vol = float(returns.std(ddof=1))
+        if vol > 1e-8:
+            result["volatility_pct"] = round(vol * np.sqrt(periods_per_year) * 100, 2)
+            excess = returns - rf_period
+            excess_std = float(excess.std(ddof=1))
+            if excess_std > 1e-8:
+                sharpe = float(excess.mean() / excess_std * np.sqrt(periods_per_year))
+                if -10.0 <= sharpe <= 10.0:
+                    result["sharpe"] = round(sharpe, 3)
+            downside = excess[excess < 0]
+            downside_std = float(downside.std(ddof=1)) if len(downside) > 1 else 0.0
+            if downside_std > 1e-8:
+                sortino = float(excess.mean() / downside_std * np.sqrt(periods_per_year))
+                if -15.0 <= sortino <= 15.0:
+                    result["sortino"] = round(sortino, 3)
 
         running_max = nav.cummax()
         drawdown = nav / running_max - 1.0
         result["max_drawdown_pct"] = round(float(drawdown.min() * 100), 2)
 
+    logger.debug(
+        "NAV history metrics for %s: observations=%d years=%.2f CAGR3=%s CAGR5=%s vol=%s drawdown=%s sharpe=%s sortino=%s",
+        code, len(df), result.get("history_years", 0), result.get("cagr_3y_pct"),
+        result.get("cagr_5y_pct"), result.get("volatility_pct"), result.get("max_drawdown_pct"),
+        result.get("sharpe"), result.get("sortino"),
+    )
     return result
 
 
@@ -274,21 +317,128 @@ def _benchmark_from_name(name: str) -> str | None:
 
 
 
-def _valid_nav_date(value: object) -> str | None:
-    """Return an ISO date and reject plan/option/header strings."""
+def _valid_nav_date(value: object, *, warn: bool = False) -> str | None:
+    """Return an ISO date; known AMFI/mftool plan labels are silently rejected."""
     raw = str(value or "").strip()
     if not raw:
         return None
+    label = _normalise_scheme_text(raw)
+    if label in {"growth", "growth option", "retail plan growth", "idcw", "idcw option", "dividend", "dividend option"}:
+        return None
     parsed = pd.to_datetime(raw, dayfirst=True, errors="coerce")
     if pd.isna(parsed):
-        logger.warning("INVALID_NAV_DATE: %r", raw)
+        if warn:
+            logger.warning("INVALID_NAV_DATE: %r", raw)
         return None
     # Guard against pandas accepting arbitrary numeric/label-like values.
     if parsed.year < 1990 or parsed.year > datetime.now().year + 1:
-        logger.warning("INVALID_NAV_DATE_RANGE: %r", raw)
+        if warn:
+            logger.warning("INVALID_NAV_DATE_RANGE: %r", raw)
         return None
     return parsed.date().isoformat()
 
+
+def _detail_value(details: dict, *names: str):
+    """Case-insensitive lookup across common mftool detail keys."""
+    if not isinstance(details, dict):
+        return None
+    normalized = {re.sub(r"[^a-z0-9]", "", str(k).lower()): v for k, v in details.items()}
+    for name in names:
+        value = normalized.get(re.sub(r"[^a-z0-9]", "", name.lower()))
+        if value not in (None, "", "-"):
+            return value
+    return None
+
+
+def _benchmark_from_details(details: dict) -> str | None:
+    value = _detail_value(details, "benchmark", "benchmark_name", "benchmark_index", "bench_mark")
+    if isinstance(value, dict):
+        value = _detail_value(value, "name", "benchmark", "index")
+    if value is None:
+        return None
+    text = re.sub(r"\s+", " ", str(value)).strip()
+    if not text or text.lower() in {"not applicable", "n/a", "na", "-"}:
+        return None
+    return text
+
+
+
+def _normalise_benchmark_key(value: object) -> str:
+    text = _normalise_scheme_text(str(value or ""))
+    # Performance endpoints often append plan/option labels that are irrelevant
+    # to benchmark identity. Keep the scheme identity, remove those labels.
+    tokens = [t for t in text.split() if t not in {
+        "direct", "regular", "growth", "option", "idcw", "dividend",
+        "payout", "reinvestment", "plan", "monthly", "quarterly", "weekly",
+    }]
+    return " ".join(tokens)
+
+
+def _extract_benchmark_rows(payload: object) -> list[dict]:
+    rows: list[dict] = []
+    if isinstance(payload, dict):
+        for value in payload.values():
+            rows.extend(_extract_benchmark_rows(value))
+    elif isinstance(payload, list):
+        for value in payload:
+            if isinstance(value, dict):
+                rows.append(value)
+            elif isinstance(value, list):
+                rows.extend(_extract_benchmark_rows(value))
+    return rows
+
+
+def _load_benchmark_map(mf: Mftool | None) -> dict[str, str]:
+    """Load benchmark data from mftool's scheme-performance endpoints.
+
+    get_scheme_details() does not expose benchmarks in the current mftool
+    implementation. Its daily performance endpoints do, so use those in a
+    small number of category-level requests rather than making one request per
+    fund.
+    """
+    if mf is None:
+        return {}
+    methods = (
+        "get_open_ended_equity_scheme_performance",
+        "get_open_ended_debt_scheme_performance",
+        "get_open_ended_hybrid_scheme_performance",
+        "get_open_ended_solution_scheme_performance",
+        "get_open_ended_other_scheme_performance",
+    )
+    result: dict[str, str] = {}
+    for method_name in methods:
+        method = getattr(mf, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            payload = method()
+            for row in _extract_benchmark_rows(payload):
+                name = row.get("scheme_name") or row.get("schemeName")
+                benchmark = row.get("benchmark") or row.get("benchmark_name")
+                if not name or not benchmark:
+                    continue
+                benchmark_text = re.sub(r"\s+", " ", str(benchmark)).strip()
+                if benchmark_text and benchmark_text.lower() not in {"na", "n/a", "-", "not applicable"}:
+                    result[_normalise_benchmark_key(name)] = benchmark_text
+        except Exception as exc:
+            logger.debug("Benchmark performance endpoint %s failed: %s", method_name, exc)
+    logger.info("Benchmark enrichment source: %d scheme benchmarks loaded from mftool performance endpoints.", len(result))
+    return result
+
+
+def _apply_benchmark_map(records: list[FundRecord], benchmark_map: dict[str, str]) -> int:
+    if not benchmark_map:
+        return 0
+    matched = 0
+    for record in records:
+        if record.benchmark:
+            continue
+        key = _normalise_benchmark_key(record.scheme_name)
+        benchmark = benchmark_map.get(key)
+        if benchmark:
+            record.benchmark = benchmark
+            matched += 1
+    return matched
 
 def _fund_record(mf: Mftool | None, item: dict, holdings: dict[str, Holding]) -> FundRecord:
     name = item["scheme_name"]
@@ -308,7 +458,18 @@ def _fund_record(mf: Mftool | None, item: dict, holdings: dict[str, Holding]) ->
     nav = safe_float(quote.get("nav"))
     if nav is None:
         nav = safe_float(item.get("nav"))
-    nav_date = _valid_nav_date(quote.get("last_updated") or item.get("date"))
+    if nav is None:
+        nav = safe_float(hist.get("latest_nav"))
+
+    # AMFI catalog date is authoritative for the current quote. Prefer it so
+    # mftool's inconsistent `last_updated` plan/option field is never parsed.
+    nav_date = _valid_nav_date(item.get("date"))
+    if nav_date is None:
+        nav_date = _valid_nav_date(hist.get("latest_nav_date"))
+    if nav_date is None:
+        nav_date = _valid_nav_date(quote.get("last_updated"))
+
+    benchmark = _benchmark_from_details(details) or _benchmark_from_name(name)
 
     return FundRecord(
         scheme_name=name,
@@ -324,7 +485,7 @@ def _fund_record(mf: Mftool | None, item: dict, holdings: dict[str, Holding]) ->
         max_drawdown_pct=hist.get("max_drawdown_pct"),
         sharpe=hist.get("sharpe"),
         sortino=hist.get("sortino"),
-        benchmark=_benchmark_from_name(name),
+        benchmark=benchmark,
     )
 
 
@@ -629,6 +790,28 @@ def build_fund_universe(settings: Settings, holdings: dict[str, Holding]) -> lis
             if completed % 10 == 0 or completed == len(raw):
                 logger.info("Fund data progress: %d/%d completed.", completed, len(raw))
 
+    # Enrich benchmarks in one batch after the concurrent NAV/history phase.
+    # mftool's per-scheme details endpoint does not contain benchmark data;
+    # its category performance endpoints do.
+    try:
+        benchmark_map = _load_benchmark_map(mf)
+        benchmark_matches = _apply_benchmark_map(records, benchmark_map)
+        if benchmark_matches:
+            logger.info("Benchmark enrichment: matched %d additional fund records.", benchmark_matches)
+    except Exception as exc:
+        logger.debug("Benchmark batch enrichment failed: %s", exc)
+
     records.sort(key=lambda x: (x.category.lower(), x.scheme_name.lower()))
+    if records:
+        logger.info(
+            "Fund enrichment coverage: CAGR3=%d/%d CAGR5=%d/%d Vol=%d/%d Drawdown=%d/%d Sharpe=%d/%d Benchmark=%d/%d NAVdate=%d/%d",
+            sum(x.cagr_3y_pct is not None for x in records), len(records),
+            sum(x.cagr_5y_pct is not None for x in records), len(records),
+            sum(x.volatility_pct is not None for x in records), len(records),
+            sum(x.max_drawdown_pct is not None for x in records), len(records),
+            sum(x.sharpe is not None or x.sortino is not None for x in records), len(records),
+            sum(bool(x.benchmark) for x in records), len(records),
+            sum(x.latest_nav is not None and x.nav_date is not None for x in records), len(records),
+        )
     logger.info("Fund data pipeline complete: %d/%d fund records built.", len(records), len(raw))
     return records
