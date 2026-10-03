@@ -1394,6 +1394,23 @@ with tab_funds:
                 st.write("**LLM challenge review**")
                 st.json(review)
 
+        data_sources = metrics.get("data_sources") or {}
+        nav_observations = metrics.get("nav_history_observations")
+        if data_sources or nav_observations:
+            with st.expander("Data sources", expanded=False):
+                if nav_observations:
+                    st.caption(f"Historical NAV observations: {nav_observations}")
+                source_rows = [
+                    {"Metric": metric, "Source": source}
+                    for metric, source in sorted(data_sources.items())
+                ]
+                if source_rows:
+                    st.dataframe(
+                        pd.DataFrame(source_rows),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+
 
 # ---------------------------------------------------------------------------
 # Portfolio

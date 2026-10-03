@@ -40,6 +40,8 @@ class FundRecord:
     market_cap_weights: dict[str, float] = field(default_factory=dict)
     valuation: dict[str, float] = field(default_factory=dict)
     source_quality: float = 0.75
+    data_sources: dict[str, str] = field(default_factory=dict)
+    nav_history_observations: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

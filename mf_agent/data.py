@@ -42,7 +42,18 @@ CATEGORY_RULES = [
 MFDATA_BASE_URL = os.getenv("MF_DATA_API_URL", "https://mfdata.in").rstrip("/")
 MFDATA_CACHE_TTL_HOURS = max(1.0, float(os.getenv("MF_DATA_CACHE_TTL_HOURS", "24")))
 MFDATA_FAMILY_ENRICHMENT_LIMIT = max(0, int(os.getenv("MF_DATA_FAMILY_ENRICHMENT_LIMIT", "10")))
-MFDATA_TIMEOUT_SECONDS = max(5, int(os.getenv("MF_DATA_TIMEOUT_SECONDS", "15")))
+MFDATA_TIMEOUT_SECONDS = max(2, int(os.getenv("MF_DATA_TIMEOUT_SECONDS", "5")))
+MFDATA_BULK_CHUNK_SIZE = max(25, min(100, int(os.getenv("MF_DATA_BULK_CHUNK_SIZE", "50"))))
+MFDATA_INDIVIDUAL_FALLBACK_LIMIT = max(0, int(os.getenv("MF_DATA_INDIVIDUAL_FALLBACK_LIMIT", "3")))
+
+# mfdata.in is a rich, optional enrichment provider. Historical NAVs are sourced
+# independently so a failure of that provider cannot erase the core performance
+# and risk metrics needed by the ranking engine. mfapi.in republishes AMFI NAV
+# history and requires no API key.
+MF_NAV_API_BASE_URL = os.getenv("MF_NAV_API_BASE_URL", "https://api.mfapi.in/mf").rstrip("/")
+MF_NAV_TIMEOUT_SECONDS = max(2, int(os.getenv("MF_NAV_TIMEOUT_SECONDS", "5")))
+MF_NAV_CACHE_TTL_HOURS = max(1.0, float(os.getenv("MF_NAV_CACHE_TTL_HOURS", "24")))
+MF_NAV_MAX_WORKERS = max(1, min(12, int(os.getenv("MF_NAV_MAX_WORKERS", "6"))))
 
 
 def classify_category(name: str) -> str:
@@ -93,48 +104,238 @@ def load_holdings(settings: Settings) -> tuple[dict[str, Holding], dict]:
         return {}, funds
 
 
+def _parse_nav_history_rows(rows) -> pd.DataFrame:
+    """Normalize common AMFI-derived NAV history response shapes."""
+    if not isinstance(rows, list):
+        return pd.DataFrame()
+
+    parsed = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        date_value = row.get("date") or row.get("Date") or row.get("nav_date")
+        nav_value = row.get("nav") or row.get("NAV") or row.get("Net Asset Value")
+        date_value = pd.to_datetime(date_value, dayfirst=True, errors="coerce")
+        nav_value = safe_float(nav_value)
+        if pd.isna(date_value) or nav_value is None or nav_value <= 0:
+            continue
+        parsed.append((date_value, float(nav_value)))
+
+    if not parsed:
+        return pd.DataFrame(columns=["date", "nav"])
+
+    df = pd.DataFrame(parsed, columns=["date", "nav"])
+    return (
+        df.drop_duplicates(subset=["date"], keep="last")
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+
+
+def _calculate_nav_metrics(df: pd.DataFrame) -> dict:
+    """Calculate performance and risk metrics from daily NAV observations."""
+    if df.empty or len(df) < 2:
+        return {}
+
+    latest_row = df.iloc[-1]
+    latest = float(latest_row["nav"])
+    latest_date = pd.Timestamp(latest_row["date"])
+    result: dict = {
+        "latest_nav": latest,
+        "nav_date": latest_date.strftime("%Y-%m-%d"),
+        "nav_history_observations": int(len(df)),
+    }
+
+    for years in (1, 3, 5):
+        target = latest_date - pd.Timedelta(days=years * 365.25)
+        prior = df[df["date"] <= target]
+        if prior.empty:
+            continue
+        old = float(prior.iloc[-1]["nav"])
+        if old > 0 and latest > 0:
+            result[f"cagr_{years}y_pct"] = round(((latest / old) ** (1 / years) - 1) * 100, 2)
+
+    returns = df["nav"].pct_change().dropna()
+    if not returns.empty:
+        daily_std = float(returns.std(ddof=1)) if len(returns) > 1 else 0.0
+        annualized_vol = daily_std * (252 ** 0.5) * 100 if daily_std > 0 else 0.0
+        result["volatility_pct"] = round(annualized_vol, 2)
+
+        if daily_std > 0:
+            result["sharpe"] = round(float(returns.mean()) / daily_std * (252 ** 0.5), 3)
+
+        downside = returns[returns < 0]
+        downside_std = float(downside.std(ddof=1)) if len(downside) > 1 else 0.0
+        if downside_std > 0:
+            result["sortino"] = round(float(returns.mean()) / downside_std * (252 ** 0.5), 3)
+
+        running_peak = df["nav"].cummax()
+        drawdowns = (df["nav"] / running_peak - 1.0) * 100.0
+        result["max_drawdown_pct"] = round(float(drawdowns.min()), 2)
+
+    return result
+
+
 def _historical_metrics(mf: Mftool, code: str) -> dict:
+    """Read historical NAV through mftool when available."""
     try:
         raw = mf.get_scheme_historical_nav(code)
         rows = raw.get("data", []) if isinstance(raw, dict) else []
-        df = pd.DataFrame(rows)
-        if df.empty:
-            return {}
-        df["date"] = pd.to_datetime(df["date"], format="%d-%m-%Y", errors="coerce")
-        df["nav"] = pd.to_numeric(df["nav"], errors="coerce")
-        df = df.dropna().sort_values("date")
-        if len(df) < 2:
-            return {}
-        latest = float(df.iloc[-1]["nav"])
-        latest_date = df.iloc[-1]["date"]
-        result = {}
-        for years in (1, 3, 5):
-            target = latest_date - timedelta(days=int(years * 365.25))
-            prior = df[df["date"] <= target]
-            if prior.empty:
-                continue
-            old = float(prior.iloc[-1]["nav"])
-            if old > 0 and latest > 0:
-                result[f"cagr_{years}y_pct"] = round(((latest / old) ** (1 / years) - 1) * 100, 2)
-        return result
+        df = _parse_nav_history_rows(rows)
+        return _calculate_nav_metrics(df)
     except Exception as exc:
         logger.debug("Historical NAV failed for %s: %s", code, exc)
         return {}
 
 
+def _nav_cache_path(settings: Settings, code: str) -> Path:
+    root = Path(settings.market_cache_dir) / "nav_history"
+    root.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(f"{MF_NAV_API_BASE_URL}/{code}".encode("utf-8")).hexdigest()
+    return root / f"{digest}.json"
+
+
+def _read_nav_cache(settings: Settings, code: str):
+    path = _nav_cache_path(settings, code)
+    try:
+        if not path.exists():
+            return None
+        age = time.time() - path.stat().st_mtime
+        if age > MF_NAV_CACHE_TTL_HOURS * 3600:
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _write_nav_cache(settings: Settings, code: str, payload) -> None:
+    try:
+        path = _nav_cache_path(settings, code)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    except Exception as exc:
+        logger.debug("Could not cache NAV history for %s: %s", code, exc)
+
+
+def _fetch_nav_history(settings: Settings, code: str) -> dict:
+    """Fetch one scheme's full NAV history from the independent AMFI-derived API."""
+    cached = _read_nav_cache(settings, code)
+    if cached is not None:
+        return cached
+
+    url = f"{MF_NAV_API_BASE_URL}/{code}"
+    try:
+        response = requests.get(
+            url,
+            timeout=MF_NAV_TIMEOUT_SECONDS,
+            headers={
+                "User-Agent": "MF Research Dashboard/2.4",
+                "Accept": "application/json",
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+            _write_nav_cache(settings, code, payload)
+            return payload
+        logger.debug("NAV provider returned no history for %s", code)
+    except (requests.exceptions.RequestException, ValueError) as exc:
+        logger.debug("Independent NAV history failed for %s: %s", code, exc)
+    return {}
+
+
+def _enrich_from_nav_api(settings: Settings, records: list[FundRecord]) -> None:
+    """Fill missing performance/risk metrics from independent AMFI-derived NAV history."""
+    targets = [
+        record
+        for record in records
+        if record.scheme_code
+        and any(
+            getattr(record, field) is None
+            for field in (
+                "cagr_1y_pct",
+                "cagr_3y_pct",
+                "cagr_5y_pct",
+                "volatility_pct",
+                "max_drawdown_pct",
+                "sharpe",
+                "sortino",
+            )
+        )
+    ]
+    if not targets:
+        return
+
+    def load(record: FundRecord):
+        return record, _fetch_nav_history(settings, record.scheme_code)
+
+    completed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MF_NAV_MAX_WORKERS) as pool:
+        futures = [pool.submit(load, record) for record in targets]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                record, payload = future.result()
+                data_rows = payload.get("data", []) if isinstance(payload, dict) else []
+                df = _parse_nav_history_rows(data_rows)
+                metrics = _calculate_nav_metrics(df)
+                if not metrics:
+                    continue
+
+                changed = False
+                for field in (
+                    "cagr_1y_pct",
+                    "cagr_3y_pct",
+                    "cagr_5y_pct",
+                    "volatility_pct",
+                    "max_drawdown_pct",
+                    "sharpe",
+                    "sortino",
+                ):
+                    if getattr(record, field) is None and metrics.get(field) is not None:
+                        setattr(record, field, metrics[field])
+                        record.data_sources[field] = "mfapi.in / AMFI NAV history"
+                        changed = True
+
+                if record.latest_nav is None and metrics.get("latest_nav") is not None:
+                    record.latest_nav = metrics["latest_nav"]
+                    record.data_sources["latest_nav"] = "mfapi.in / AMFI NAV history"
+                    changed = True
+                if not record.nav_date and metrics.get("nav_date"):
+                    record.nav_date = metrics["nav_date"]
+                    record.data_sources["nav_date"] = "mfapi.in / AMFI NAV history"
+                    changed = True
+                if changed:
+                    record.data_sources["nav_history"] = "mfapi.in / AMFI NAV history"
+                    record.nav_history_observations = metrics.get("nav_history_observations")
+                    record.source_quality = max(record.source_quality, 0.90)
+                    completed += 1
+            except Exception as exc:
+                logger.debug("NAV enrichment failed for a fund: %s", exc)
+
+    logger.info(
+        "Independent NAV enrichment: %d/%d funds received historical evidence; cache TTL=%sh.",
+        completed,
+        len(targets),
+        MF_NAV_CACHE_TTL_HOURS,
+    )
+
+
 def _make_session() -> requests.Session:
     session = requests.Session()
+    # mfdata is an optional enrichment provider. Do not let urllib3 perform
+    # hidden connection/read retries because they can turn one provider outage
+    # into minutes of dashboard latency. Circuit-break the provider instead.
     retry = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        backoff_factor=1.0,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset({"GET", "POST"}),
-        respect_retry_after_header=True,
+        total=0,
+        connect=0,
+        read=0,
+        redirect=0,
+        status=0,
         raise_on_status=False,
     )
     session.mount("https://", HTTPAdapter(max_retries=retry))
+    session._mfdata_unavailable = False
     session.headers.update({
         "User-Agent": "MF Research Dashboard/2.3",
         "Accept": "application/json",
@@ -171,7 +372,15 @@ def _write_cache(path: Path, payload) -> None:
         logger.debug("Could not cache mfdata response: %s", exc)
 
 
+def _mark_mfdata_unavailable(session: requests.Session, reason: str) -> None:
+    if not getattr(session, "_mfdata_unavailable", False):
+        session._mfdata_unavailable = True
+        logger.warning("mfdata enrichment disabled for this run: %s", reason)
+
+
 def _mfdata_get(session: requests.Session, settings: Settings, path: str, params: dict | None = None):
+    if getattr(session, "_mfdata_unavailable", False):
+        return None
     url = f"{MFDATA_BASE_URL}{path}"
     cache = _cache_path(settings, url, params)
     cached = _read_cache(cache)
@@ -179,18 +388,26 @@ def _mfdata_get(session: requests.Session, settings: Settings, path: str, params
         return cached
     try:
         response = session.get(url, params=params, timeout=MFDATA_TIMEOUT_SECONDS)
+        if response.status_code >= 500:
+            _mark_mfdata_unavailable(session, f"HTTP {response.status_code} from {path}")
+            return None
         if response.status_code >= 400:
             logger.warning("mfdata GET %s returned HTTP %s", path, response.status_code)
             return None
         payload = response.json()
         _write_cache(cache, payload)
         return payload
-    except Exception as exc:
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+        _mark_mfdata_unavailable(session, f"{type(exc).__name__} for {path}")
+        return None
+    except (ValueError, requests.exceptions.RequestException) as exc:
         logger.warning("mfdata GET failed for %s: %s", path, exc)
         return None
 
 
 def _mfdata_post(session: requests.Session, settings: Settings, path: str, payload: dict):
+    if getattr(session, "_mfdata_unavailable", False):
+        return None
     url = f"{MFDATA_BASE_URL}{path}"
     cache = _cache_path(settings, url, payload)
     cached = _read_cache(cache)
@@ -198,13 +415,19 @@ def _mfdata_post(session: requests.Session, settings: Settings, path: str, paylo
         return cached
     try:
         response = session.post(url, json=payload, timeout=MFDATA_TIMEOUT_SECONDS)
+        if response.status_code >= 500:
+            _mark_mfdata_unavailable(session, f"HTTP {response.status_code} from {path}")
+            return None
         if response.status_code >= 400:
             logger.warning("mfdata POST %s returned HTTP %s", path, response.status_code)
             return None
         result = response.json()
         _write_cache(cache, result)
         return result
-    except Exception as exc:
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+        _mark_mfdata_unavailable(session, f"{type(exc).__name__} for {path}")
+        return None
+    except (ValueError, requests.exceptions.RequestException) as exc:
         logger.warning("mfdata POST failed for %s: %s", path, exc)
         return None
 
@@ -299,10 +522,17 @@ def _enrich_from_mfdata(settings: Settings, records: list[FundRecord], holdings:
     codes = [r.scheme_code for r in records if r.scheme_code]
     details_by_code: dict[str, dict] = {}
 
-    # Bulk endpoint: one request per 100 schemes instead of one request per fund.
-    for start in range(0, len(codes), 100):
-        chunk = codes[start:start + 100]
-        payload = _mfdata_post(session, settings, "/api/v1/schemes/bulk", {"scheme_codes": [int(x) if str(x).isdigit() else str(x) for x in chunk]})
+    # The catalog endpoint is intentionally never called here. AMFI/mftool already
+    # provide the universe. mfdata is only an optional enrichment provider.
+    # Keep bulk requests below the documented maximum to reduce timeout risk.
+    for start in range(0, len(codes), MFDATA_BULK_CHUNK_SIZE):
+        chunk = codes[start:start + MFDATA_BULK_CHUNK_SIZE]
+        payload = _mfdata_post(
+            session,
+            settings,
+            "/api/v1/schemes/bulk",
+            {"scheme_codes": [int(x) if str(x).isdigit() else str(x) for x in chunk]},
+        )
         data = _payload_data(payload)
         if isinstance(data, list):
             for item in data:
@@ -310,21 +540,25 @@ def _enrich_from_mfdata(settings: Settings, records: list[FundRecord], holdings:
                     code = str(item.get("scheme_code") or item.get("amfi_code") or "")
                     if code:
                         details_by_code[code] = item
+        if getattr(session, "_mfdata_unavailable", False):
+            break
 
-    # If bulk is unavailable, do not hammer the API. A cached individual response is
-    # still useful for held funds and the first few ranking candidates.
-    if not details_by_code:
+    # Individual fallback is deliberately tiny and only uses valid scheme codes.
+    # If the provider timed out, the circuit breaker prevents any further calls.
+    if not details_by_code and not getattr(session, "_mfdata_unavailable", False) and MFDATA_INDIVIDUAL_FALLBACK_LIMIT:
         priority = []
         held_lower = {name.lower() for name in holdings}
         for record in records:
-            if record.scheme_name.lower() in held_lower:
+            if record.scheme_code and record.scheme_name.lower() in held_lower:
                 priority.append(record)
-        priority.extend(r for r in records if r not in priority)
-        for record in priority[:MFDATA_FAMILY_ENRICHMENT_LIMIT]:
+        priority.extend(r for r in records if r.scheme_code and r not in priority)
+        for record in priority[:MFDATA_INDIVIDUAL_FALLBACK_LIMIT]:
             payload = _mfdata_get(session, settings, f"/api/v1/schemes/{record.scheme_code}")
             data = _payload_data(payload)
             if isinstance(data, dict):
                 details_by_code[record.scheme_code] = data
+            if getattr(session, "_mfdata_unavailable", False):
+                break
 
     for record in records:
         detail = details_by_code.get(record.scheme_code)
@@ -408,6 +642,13 @@ def _enrich_from_mfdata(settings: Settings, records: list[FundRecord], holdings:
 
         if record.holdings or record.sector_weights or record.valuation or record.sharpe is not None:
             record.source_quality = 1.0
+
+    if getattr(session, "_mfdata_unavailable", False):
+        logger.warning("mfdata enrichment skipped after provider failure; using fallback data for this run.")
+    elif details_by_code:
+        logger.info("mfdata enrichment completed for %d/%d schemes.", len(details_by_code), len(codes))
+    else:
+        logger.info("mfdata returned no enrichment data; using fallback sources.")
 
 
 def _fund_record(mf: Mftool, item: dict, holdings: dict[str, Holding]) -> FundRecord:
@@ -516,5 +757,12 @@ def build_fund_universe(settings: Settings, holdings: dict[str, Holding]) -> lis
         _enrich_from_mfdata(settings, records, holdings)
     except Exception as exc:
         logger.warning("mfdata enrichment failed; continuing with fallback data: %s", exc)
+
+    # Historical NAV evidence is independent of mfdata. Run it after the rich
+    # provider so it only fills missing metrics and never overwrites better data.
+    try:
+        _enrich_from_nav_api(settings, records)
+    except Exception as exc:
+        logger.warning("Independent NAV enrichment failed; continuing with available data: %s", exc)
 
     return records
