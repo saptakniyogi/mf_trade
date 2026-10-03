@@ -78,9 +78,10 @@ KAGGLE_NAV_DATASET = os.getenv(
 ).strip()
 KAGGLE_NAV_CACHE_DIR = os.getenv("MF_KAGGLE_NAV_CACHE_DIR", "kaggle_nav_cache")
 KAGGLE_NAV_MAX_STALENESS_DAYS = max(1, int(os.getenv("MF_KAGGLE_NAV_MAX_STALENESS_DAYS", "45")))
-KAGGLE_NAV_CACHE_TTL_HOURS = max(1.0, float(os.getenv("MF_KAGGLE_NAV_CACHE_TTL_HOURS", "168")))
+KAGGLE_NAV_CACHE_TTL_HOURS = max(1.0, float(os.getenv("MF_KAGGLE_NAV_CACHE_TTL_HOURS", "24")))
 KAGGLE_NAV_CHUNK_SIZE = max(10_000, int(os.getenv("MF_KAGGLE_NAV_CHUNK_SIZE", "100000")))
-KAGGLE_NAV_SOURCE_QUALITY = 0.82
+KAGGLE_NAV_SOURCE_QUALITY = 0.96
+KAGGLE_REFRESH_WEEKENDS = os.getenv("MF_KAGGLE_REFRESH_WEEKENDS", "true").strip().lower() not in {"0", "false", "no"}
 
 def classify_category(name: str) -> str:
     lower = name.lower()
@@ -305,12 +306,25 @@ def _kaggle_file_columns(path: Path) -> tuple[list[str], str, str | None] | None
             sep = "\t" if suffix == ".tsv" else ","
             return list(pd.read_csv(path, sep=sep, nrows=0).columns), sep, None
         if suffix == ".parquet":
-            # The Kaggle dataset stores Scheme_Code as the parquet index, so
-            # pandas exposes only Date/NAV in ``frame.columns``. Inspect the
-            # empty projection to recover the index name without loading the
-            # 100+ MB history twice.
-            frame = pd.read_parquet(path, columns=[], engine="auto")
-            return list(frame.columns), "parquet", frame.index.name
+            # Inspect the Parquet schema without materialising the 100+ MB NAV
+            # history. pandas metadata tells us which field is stored as the
+            # DataFrame index.
+            import pyarrow.parquet as pq
+
+            parquet_file = pq.ParquetFile(path)
+            columns = list(parquet_file.schema_arrow.names)
+            index_name = None
+            metadata = parquet_file.schema_arrow.metadata or {}
+            pandas_meta = metadata.get(b"pandas")
+            if pandas_meta:
+                try:
+                    pandas_payload = json.loads(pandas_meta.decode("utf-8"))
+                    index_columns = pandas_payload.get("index_columns", [])
+                    if index_columns and isinstance(index_columns[0], str):
+                        index_name = index_columns[0]
+                except Exception:
+                    pass
+            return columns, "parquet", index_name
         return None
     except Exception as exc:
         logger.warning("Could not inspect Kaggle NAV file %s: %s", path, exc)
@@ -339,6 +353,48 @@ def _kaggle_dataset_files(dataset_path: str) -> list[Path]:
     )
 
 
+def _kaggle_refresh_marker(settings: Settings) -> Path:
+    return _kaggle_cache_root(settings) / "refresh_state.json"
+
+
+def _read_kaggle_refresh_state(settings: Settings) -> dict:
+    path = _kaggle_refresh_marker(settings)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_kaggle_refresh_state(settings: Settings, *, refreshed_at: str, dataset_path: str, files: list[Path]) -> None:
+    payload = {
+        "refreshed_at": refreshed_at,
+        "refresh_date": refreshed_at[:10],
+        "dataset": KAGGLE_NAV_DATASET,
+        "dataset_path": dataset_path,
+        "files": [str(path) for path in files],
+    }
+    path = _kaggle_refresh_marker(settings)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _kaggle_should_refresh(settings: Settings) -> bool:
+    state = _read_kaggle_refresh_state(settings)
+    refresh_date = str(state.get("refresh_date") or "")
+    today = dt.date.today()
+    if refresh_date == today.isoformat():
+        return False
+    if today.weekday() < 5:
+        return True
+    return KAGGLE_REFRESH_WEEKENDS
+
+
+def _kaggle_existing_dataset_files(settings: Settings) -> list[Path]:
+    return _kaggle_dataset_files(str(_kaggle_cache_root(settings) / "dataset"))
+
+
 def _download_kaggle_nav_dataset(settings: Settings) -> list[Path]:
     if not KAGGLE_NAV_ENABLED:
         return []
@@ -349,16 +405,35 @@ def _download_kaggle_nav_dataset(settings: Settings) -> list[Path]:
         return []
 
     output_dir = _kaggle_cache_root(settings) / "dataset"
+    existing = _kaggle_existing_dataset_files(settings)
+    force_download = _kaggle_should_refresh(settings)
+    if existing and not force_download:
+        state = _read_kaggle_refresh_state(settings)
+        logger.info(
+            "Kaggle dataset cache is current for %s; using local snapshot (refreshed=%s)",
+            dt.date.today().isoformat(),
+            state.get("refreshed_at", "unknown"),
+        )
+        return existing
+
     try:
         dataset_path = kagglehub.dataset_download(
             KAGGLE_NAV_DATASET,
             output_dir=str(output_dir),
+            force_download=force_download,
         )
         files = _kaggle_dataset_files(dataset_path)
         if not files:
             logger.warning("Kaggle NAV dataset downloaded but no CSV/TSV/Parquet files were found: %s", dataset_path)
-            return []
-        logger.info("Kaggle NAV dataset available: %s (%d data files)", dataset_path, len(files))
+            return existing
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        _write_kaggle_refresh_state(settings, refreshed_at=now, dataset_path=dataset_path, files=files)
+        logger.info(
+            "Kaggle dataset refreshed: %s (%d data files); force_download=%s",
+            dataset_path,
+            len(files),
+            force_download,
+        )
         return files
     except Exception as exc:
         logger.warning(
@@ -367,6 +442,104 @@ def _download_kaggle_nav_dataset(settings: Settings) -> list[Path]:
             exc,
         )
         return []
+
+
+def _load_kaggle_scheme_snapshot(settings: Settings, records: list[FundRecord]) -> dict[str, dict]:
+    """Load current scheme metadata from Kaggle's daily snapshot.
+
+    ``mutual_fund_data.csv`` is the primary source for current scheme metadata.
+    AMFI/mftool and mfdata only fill fields that Kaggle does not provide.
+    """
+    targets_by_code = {_kaggle_code_key(r.scheme_code): r for r in records if r.scheme_code}
+    targets_by_name = {_kaggle_name_key(r.scheme_name): r for r in records}
+    files = _download_kaggle_nav_dataset(settings)
+    if not files:
+        return {}
+
+    snapshot_files = [p for p in files if "mutual_fund_data" in p.name.lower() and p.suffix.lower() == ".csv"]
+    if not snapshot_files:
+        logger.warning("Kaggle scheme snapshot file mutual_fund_data.csv was not found.")
+        return {}
+
+    path = snapshot_files[0]
+    try:
+        frame = pd.read_csv(path, low_memory=False)
+    except Exception as exc:
+        logger.warning("Could not read Kaggle scheme snapshot %s: %s", path, exc)
+        return {}
+
+    code_col = _find_kaggle_column(list(frame.columns), ("scheme code", "scheme_code", "amfi code", "amfi_code", "code"))
+    name_col = _find_kaggle_column(list(frame.columns), ("scheme name", "scheme_name", "fund name", "fund_name", "name"))
+    if not code_col and not name_col:
+        logger.warning("Kaggle scheme snapshot has no usable Scheme_Code/Scheme_Name column: %s", list(frame.columns))
+        return {}
+
+    def col(*names: str) -> str | None:
+        return _find_kaggle_column(list(frame.columns), names)
+
+    amc_col = col("amc")
+    category_col = col("scheme category", "scheme_category", "category")
+    nav_col = col("nav", "net asset value", "net_asset_value")
+    nav_date_col = col("latest nav date", "latest_nav_date", "nav date", "nav_date")
+    launch_col = col("launch date", "launch_date", "inception date", "inception_date")
+    aum_col = col("average aum cr", "average_aum_cr", "aum cr", "aum_inr_cr", "aum")
+    plan_col = col("scheme nav name", "scheme_nav_name")
+
+    matched = 0
+    result: dict[str, dict] = {}
+    for row in frame.to_dict(orient="records"):
+        code = _kaggle_code_key(row.get(code_col)) if code_col else ""
+        name = str(row.get(name_col) or "").strip() if name_col else ""
+        record = targets_by_code.get(code) if code else None
+        if record is None and name:
+            record = targets_by_name.get(_kaggle_name_key(name))
+        if record is None:
+            continue
+
+        key = record.scheme_code or record.scheme_name
+        values = {
+            "scheme_name": name or record.scheme_name,
+            "amc": str(row.get(amc_col) or "").strip() if amc_col else "",
+            "category": str(row.get(category_col) or "").strip() if category_col else "",
+            "latest_nav": safe_float(row.get(nav_col)) if nav_col else None,
+            "nav_date": str(row.get(nav_date_col) or "").strip() if nav_date_col else "",
+            "inception_date": str(row.get(launch_col) or "").strip() if launch_col else "",
+            "aum_inr_cr": safe_float(row.get(aum_col)) if aum_col else None,
+            "scheme_nav_name": str(row.get(plan_col) or "").strip() if plan_col else "",
+        }
+        result[key] = values
+        matched += 1
+
+    logger.info("Kaggle scheme snapshot matched %d/%d selected funds.", matched, len(records))
+    return result
+
+
+def _enrich_from_kaggle_snapshot(settings: Settings, records: list[FundRecord]) -> None:
+    snapshot = _load_kaggle_scheme_snapshot(settings, records)
+    for record in records:
+        values = snapshot.get(record.scheme_code or record.scheme_name)
+        if not values:
+            continue
+        for field in ("latest_nav", "nav_date", "aum_inr_cr", "inception_date"):
+            value = values.get(field)
+            if value is None or value == "":
+                continue
+            setattr(record, field, value)
+            record.data_sources[field] = "Kaggle / mutual_fund_data.csv"
+        if values.get("amc"):
+            record.amc = values["amc"]
+            record.data_sources["amc"] = "Kaggle / mutual_fund_data.csv"
+        if values.get("category"):
+            record.category = values["category"]
+            record.data_sources["category"] = "Kaggle / mutual_fund_data.csv"
+        if values.get("scheme_nav_name"):
+            nav_name = values["scheme_nav_name"]
+            lower = nav_name.lower()
+            if "direct" in lower:
+                record.plan_type = "Direct Growth" if "growth" in lower else "Direct"
+            elif "regular" in lower:
+                record.plan_type = "Regular Growth" if "growth" in lower else "Regular"
+        record.source_quality = max(record.source_quality, KAGGLE_NAV_SOURCE_QUALITY)
 
 
 def _load_kaggle_histories(settings: Settings, records: list[FundRecord]) -> dict[str, pd.DataFrame]:
@@ -439,8 +612,8 @@ def _load_kaggle_histories(settings: Settings, records: list[FundRecord]) -> dic
                 if chunk.empty:
                     continue
 
-                for row in chunk.itertuples(index=False, name=None):
-                    values = dict(zip(usecols, row))
+                for row in chunk.itertuples(index=False, name="KaggleRow"):
+                    values = row._asdict()
                     code = _kaggle_code_key(values.get(code_col)) if code_col else ""
                     name = str(values.get(name_col) or "").strip() if name_col else ""
                     matched: list[FundRecord] = []
@@ -533,7 +706,7 @@ def _enrich_from_kaggle_nav(settings: Settings, records: list[FundRecord]) -> No
             if field in risk_fields and len(history) < 30:
                 continue
             value = metrics.get(field)
-            if value is not None and getattr(record, field) is None:
+            if value is not None:
                 setattr(record, field, value)
                 record.data_sources[field] = "Kaggle / mutual-fund-historic-nav-data"
                 changed = True
@@ -988,21 +1161,21 @@ def _record_mfdata_detail(record: FundRecord, detail: dict) -> None:
     record.source_quality = max(record.source_quality, 0.90)
 
     nav = _number(detail.get("nav"))
-    if nav is not None:
+    if nav is not None and record.latest_nav is None:
         record.latest_nav = nav
         record.data_sources["latest_nav"] = "mfdata.in scheme details"
-    if detail.get("nav_date"):
+    if detail.get("nav_date") and record.nav_date is None:
         record.nav_date = detail.get("nav_date")
         record.data_sources["nav_date"] = "mfdata.in scheme details"
     aum = _number(detail.get("aum_cr", detail.get("aum_inr_cr")))
-    if aum is not None:
+    if aum is not None and record.aum_inr_cr is None:
         record.aum_inr_cr = aum
         record.data_sources["aum_inr_cr"] = "mfdata.in scheme details"
-    if detail.get("inception_date"):
+    if detail.get("inception_date") and record.inception_date is None:
         record.inception_date = detail.get("inception_date")
         record.data_sources["inception_date"] = "mfdata.in scheme details"
     benchmark = detail.get("benchmark")
-    if benchmark and str(benchmark).strip() not in {"-", "NA", "N/A"}:
+    if benchmark and record.benchmark is None and str(benchmark).strip() not in {"-", "NA", "N/A"}:
         record.benchmark = str(benchmark).strip()
         record.data_sources["benchmark"] = "mfdata.in scheme details"
 
@@ -1288,19 +1461,19 @@ def build_fund_universe(settings: Settings, holdings: dict[str, Holding]) -> lis
 
     records.sort(key=lambda x: (x.category.lower(), x.scheme_name.lower()))
 
-    # mftool exposes AMFI's daily direct-plan 1Y/3Y/5Y performance and benchmark
-    # directly. This is more authoritative for these fields than deriving returns
-    # from a second NAV provider.
+    # Kaggle is the primary daily scheme snapshot and NAV-history source.
+    # mftool/AMFI is retained as a fallback for anything Kaggle does not cover.
+    try:
+        _enrich_from_kaggle_snapshot(settings, records)
+        _enrich_from_kaggle_nav(settings, records)
+    except Exception as exc:
+        logger.warning("Kaggle primary enrichment failed; continuing with AMFI/mftool and mfdata: %s", exc)
+
     try:
         performance = _load_mftool_performance(mf, settings, records)
         _enrich_from_mftool_performance(records, performance)
     except Exception as exc:
         logger.warning("mftool performance enrichment failed: %s", exc)
-
-    try:
-        _enrich_from_kaggle_nav(settings, records)
-    except Exception as exc:
-        logger.warning("Kaggle NAV fallback enrichment failed; continuing with existing providers: %s", exc)
 
     try:
         _enrich_from_mfdata(settings, records, holdings)

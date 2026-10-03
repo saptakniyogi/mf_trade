@@ -60,3 +60,19 @@ MF_KAGGLE_NAV_CHUNK_SIZE=100000
 ```
 
 If Kaggle asks for authentication, set `KAGGLE_API_TOKEN` or configure the Kaggle credentials supported by `kagglehub`. Public resources normally do not require authentication unless Kaggle requests consent/authentication.
+
+## Kaggle primary data source
+
+The application uses `tharunreddy2911/mutual-fund-historic-nav-data` as the primary local mutual-fund data source. The dataset contains a daily scheme snapshot (`mutual_fund_data.csv`) and historical NAV data (`mutual_fund_nav_history.parquet`).
+
+Kaggle data is refreshed at most once per day. On weekdays, if the local refresh marker is not for the current date, the application requests the latest Kaggle dataset with `force_download=True`. If the refresh fails, the last successful local snapshot remains available and the analysis continues. Weekend refreshes can be disabled with `MF_KAGGLE_REFRESH_WEEKENDS=false`.
+
+Kaggle is authoritative for fields it supplies, including scheme metadata, latest NAV, NAV date, average AUM and NAV-derived performance/risk metrics. AMFI/mftool and mfdata are used only to fill fields Kaggle does not provide or when Kaggle is unavailable.
+
+Relevant settings:
+
+- `MF_KAGGLE_NAV_ENABLED=true`
+- `MF_KAGGLE_NAV_DATASET=tharunreddy2911/mutual-fund-historic-nav-data`
+- `MF_KAGGLE_NAV_CACHE_TTL_HOURS=24`
+- `MF_KAGGLE_REFRESH_WEEKENDS=true`
+- `MF_KAGGLE_NAV_CACHE_DIR=kaggle_nav_cache`
