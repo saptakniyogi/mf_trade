@@ -15,8 +15,11 @@ logger = logging.getLogger("mf_agent")
 
 SYSTEM_PROMPT = """You are the qualitative investment-committee layer of an Indian mutual-fund research engine.
 
-The quantitative engine has already calculated the fund scores, portfolio fit, macro regime and allocation constraints.
-Your job is NOT to invent a BUY/SELL thesis from scratch. Your job is to challenge the quantitative result.
+The quantitative engine has already calculated the fund scores, portfolio fit, macro regime,
+hard evidence gates, portfolio constraints, and independent investment-route availability.
+Your job is NOT to invent a BUY/SELL thesis from scratch. Your job is to challenge the
+quantitative result and decide whether the investment should be made as a one-time investment,
+a SIP, both, or neither.
 
 Rules:
 1. Treat supplied numerical data as authoritative. Never invent missing metrics.
@@ -26,8 +29,16 @@ Rules:
 5. You may downgrade a proposed action when there is a material contradiction, but explain why.
 6. Do not use recent performance alone as a reason to buy.
 7. Prefer WAIT over forcing a transaction when evidence is insufficient.
-8. Every review must contain at least one useful reason or explicit data-gap explanation.
-9. Return JSON only.
+8. Evaluate ONE_TIME and SIP independently. The absence of one route does not imply that the
+   other route is unsuitable.
+9. Choose ONE_TIME only when investment_options.one_time.status is AVAILABLE.
+10. Choose SIP only when investment_options.sip.status is AVAILABLE.
+11. Choose BOTH only when both routes are AVAILABLE and using both is justified.
+12. Choose NEITHER when neither route is appropriate.
+13. Do not invent a SIP amount. The engine may provide a configured amount, otherwise leave it
+   to the user/application to determine.
+14. Every review must contain at least one useful reason or explicit data-gap explanation.
+15. Return JSON only.
 
 Output:
 {
@@ -35,6 +46,9 @@ Output:
     {
       "scheme_name": "string",
       "llm_action": "BUY|ACCUMULATE|HOLD|TRIM|WAIT",
+      "investment_mode": "ONE_TIME|SIP|BOTH|NEITHER",
+      "mode_confidence": 0,
+      "mode_reasons": ["string"],
       "challenge_level": 0,
       "thesis_supported": true,
       "key_reasons": ["string"],
@@ -105,9 +119,6 @@ class OpenRouterReviewer:
         ranked = engine_result.get("local_ranking", {}).get("llm_candidates") or evaluated[:15]
         ranked_by_name = {x.get("scheme_name"): x for x in ranked}
 
-        # Allocation candidates are always reviewed when LLM mode is enabled.
-        # Previously the LLM shortlist could exclude an allocated fund entirely,
-        # leaving the allocation UI without a qualitative reason.
         shortlist = []
         for item in allocation:
             candidate = ranked_by_name.get(item.get("scheme_name"))
@@ -120,6 +131,7 @@ class OpenRouterReviewer:
                 )
                 if candidate:
                     shortlist.append(candidate)
+
         seen = {x.get("scheme_name") for x in shortlist}
         for item in ranked:
             if item.get("scheme_name") not in seen:
@@ -137,11 +149,14 @@ class OpenRouterReviewer:
         shared_context = {
             "market_regime": market.get("regime", {}),
             "macro": market.get("macro", {}),
+            "investment_mode": engine_result.get("settings", {}).get("investment_mode", "BOTH"),
+            "sip_monthly_amount": engine_result.get("settings", {}).get("sip_monthly_amount", 0.0),
             "relevant_news": [
                 {k: article.get(k) for k in ("title", "source", "published", "event_tags", "transmission_channels", "summary", "vector_similarity")}
                 for article in relevant_news
             ],
         }
+
         candidates = []
         for x in shortlist:
             score = x.get("score", {})
@@ -165,11 +180,12 @@ class OpenRouterReviewer:
                 },
                 "portfolio_performance": x["portfolio_performance"],
                 "allocation": x["allocation"],
+                "investment_options": x.get("investment_options", {}),
+                "quantitative_investment_mode": x.get("quantitative_investment_mode"),
                 "vector_similarity": x.get("vector_similarity"),
                 "local_rank": x.get("local_rank"),
             })
 
-        context = {"context": shared_context, "funds": candidates}
         all_reviews = []
         tokens = 0
         batches = list(chunked(candidates, self.settings.batch_size))

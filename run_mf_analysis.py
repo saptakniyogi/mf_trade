@@ -28,6 +28,44 @@ def _normalise_llm_action(action: str | None) -> str:
     return value if value in allowed else "WAIT"
 
 
+def _normalise_investment_mode(mode: str | None) -> str:
+    allowed = {"ONE_TIME", "SIP", "BOTH", "NEITHER"}
+    value = str(mode or "NEITHER").upper().strip()
+    return value if value in allowed else "NEITHER"
+
+
+def _resolve_investment_mode(fund: dict, review: dict | None) -> tuple[str, list[str]]:
+    options = fund.get("investment_options", {})
+    one_time_available = bool(options.get("one_time", {}).get("eligible", False))
+    sip_available = bool(options.get("sip", {}).get("eligible", False))
+
+    requested = _normalise_investment_mode(
+        review.get("investment_mode") if review else fund.get("quantitative_investment_mode")
+    )
+
+    allowed = {
+        "ONE_TIME": one_time_available,
+        "SIP": sip_available,
+        "BOTH": one_time_available and sip_available,
+        "NEITHER": True,
+    }
+    if allowed.get(requested, False):
+        return requested, []
+
+    if one_time_available and sip_available:
+        fallback = "BOTH"
+    elif one_time_available:
+        fallback = "ONE_TIME"
+    elif sip_available:
+        fallback = "SIP"
+    else:
+        fallback = "NEITHER"
+
+    return fallback, [
+        f"LLM requested {requested}, but that investment route is not quantitatively available."
+    ]
+
+
 def merge_reviews(result: dict, reviews: list[dict]) -> None:
     by_name = {
         r.get("scheme_name"): r
@@ -68,6 +106,15 @@ def merge_reviews(result: dict, reviews: list[dict]) -> None:
             llm_action = "WAIT"
 
         fund["final_action"] = llm_action or quantitative_action
+        fund["llm_investment_mode"] = (
+            _normalise_investment_mode(review.get("investment_mode"))
+            if review else None
+        )
+        final_mode, mode_blockers = _resolve_investment_mode(fund, review)
+        fund["final_investment_mode"] = final_mode
+        fund["investment_mode_blockers"] = mode_blockers
+        if final_mode == "NEITHER" and fund["final_action"] in {"BUY", "ACCUMULATE"}:
+            fund["final_action"] = "WAIT"
 
     # Reconcile the allocation plan after qualitative review.
     # Capital must never remain allocated to a fund whose final action is WAIT/HOLD/TRIM.
@@ -121,8 +168,14 @@ def merge_reviews(result: dict, reviews: list[dict]) -> None:
         )
         item["llm_review"] = review
         item["final_action"] = final_action
+        item["llm_investment_mode"] = fund.get("llm_investment_mode")
+        item["final_investment_mode"] = fund.get("final_investment_mode", "NEITHER")
+        item["investment_mode_blockers"] = fund.get("investment_mode_blockers", [])
 
-        if final_action in {"BUY", "ACCUMULATE"}:
+        if (
+            final_action in {"BUY", "ACCUMULATE"}
+            and item["final_investment_mode"] in {"ONE_TIME", "BOTH"}
+        ):
             reconciled_allocation.append(item)
         else:
             logger.info(
@@ -132,6 +185,43 @@ def merge_reviews(result: dict, reviews: list[dict]) -> None:
             )
 
     result["allocation_plan"] = reconciled_allocation
+    result["sip_recommendations"] = _build_sip_recommendations(result)
+
+
+def _build_sip_recommendations(result: dict) -> list[dict]:
+    recommendations = []
+    for fund in result.get("evaluated_funds", []):
+        if (
+            fund.get("final_action") in {"BUY", "ACCUMULATE"}
+            and fund.get("final_investment_mode") in {"SIP", "BOTH"}
+            and fund.get("investment_options", {}).get("sip", {}).get("eligible", False)
+        ):
+            review = fund.get("llm_review") or {}
+            recommendations.append({
+                "scheme_name": fund["scheme_name"],
+                "category": fund["category"],
+                "amc": fund["amc"],
+                "final_action": fund["final_action"],
+                "final_investment_mode": fund["final_investment_mode"],
+                "sip_monthly_amount": result.get("settings", {}).get("sip_monthly_amount", 0.0),
+                "score": fund.get("score", {}).get("overall"),
+                "ranking_score": fund.get("score", {}).get("ranking_score"),
+                "data_confidence": fund.get("score", {}).get("data_confidence"),
+                "evidence_status": fund.get("score", {}).get("evidence_status"),
+                "investment_options": fund.get("investment_options", {}),
+                "llm_review": review,
+                "reason": (
+                    review.get("final_comment")
+                    or (review.get("mode_reasons") or [None])[0]
+                    or (fund.get("score", {}).get("reasons_to_buy") or [None])[0]
+                    or "Selected as an evidence-qualified SIP candidate."
+                ),
+            })
+    return sorted(
+        recommendations,
+        key=lambda x: (float(x.get("ranking_score") or 0), float(x.get("data_confidence") or 0)),
+        reverse=True,
+    )
 
 
 def _fallback_without_llm(result: dict) -> None:
@@ -147,6 +237,12 @@ def _fallback_without_llm(result: dict) -> None:
                 action = "WAIT"
 
         fund["final_action"] = action
+        fund["llm_investment_mode"] = None
+        final_mode, mode_blockers = _resolve_investment_mode(fund, None)
+        fund["final_investment_mode"] = final_mode
+        fund["investment_mode_blockers"] = mode_blockers
+        if final_mode == "NEITHER" and fund["final_action"] in {"BUY", "ACCUMULATE"}:
+            fund["final_action"] = "WAIT"
 
     # There is no qualitative veto available, so preserve only
     # evidence-qualified allocations.
@@ -175,6 +271,8 @@ def _fallback_without_llm(result: dict) -> None:
             "final_action",
             fund.get("action", "WAIT"),
         )
+        item["final_investment_mode"] = fund.get("final_investment_mode", "NEITHER")
+        item["investment_mode_blockers"] = fund.get("investment_mode_blockers", [])
         item["evidence_status"] = score.get(
             "evidence_status"
         )
@@ -194,9 +292,14 @@ def _fallback_without_llm(result: dict) -> None:
             or "Selected by the evidence-qualified quantitative engine."
         )
 
-        allocation.append(item)
+        if (
+            item["final_action"] in {"BUY", "ACCUMULATE"}
+            and item["final_investment_mode"] in {"ONE_TIME", "BOTH"}
+        ):
+            allocation.append(item)
 
     result["allocation_plan"] = allocation
+    result["sip_recommendations"] = _build_sip_recommendations(result)
 
 
 def main():
@@ -279,6 +382,8 @@ def main():
             ),
             "llm_review_count": len(reviews),
             "llm_input_tokens": tokens,
+            "one_time_recommendation_count": len(engine_result.get("allocation_plan", [])),
+            "sip_recommendation_count": len(engine_result.get("sip_recommendations", [])),
         },
         **engine_result,
         "top_candidates": top_candidates[:10],

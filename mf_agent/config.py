@@ -70,6 +70,8 @@ class Settings:
     openrouter_secondary_models: list[str] = field(default_factory=list)
     openrouter_temperature: float = 0.1
     allocation_mode: str = "DIVERSIFIED"
+    investment_mode: str = "BOTH"
+    sip_monthly_amount: float = 0.0
     horizon: HorizonConfig = field(default_factory=lambda: HorizonConfig("LONG_TERM", ">5 years", ">5 years", None))
     policy: PortfolioPolicy = field(default_factory=PortfolioPolicy)
 
@@ -106,6 +108,10 @@ def load_settings() -> Settings:
     if allocation not in {"DIVERSIFIED", "CONCENTRATED"}:
         allocation = "DIVERSIFIED"
 
+    investment_mode = os.getenv("MF_INVESTMENT_MODE", "BOTH").upper()
+    if investment_mode not in {"ONE_TIME", "SIP", "BOTH"}:
+        investment_mode = "BOTH"
+
     policy = PortfolioPolicy(
         max_category_pct=_float("MAX_CATEGORY_EXPOSURE_PCT", 35.0),
         max_single_fund_pct=_float("MAX_SINGLE_FUND_PCT", 25.0),
@@ -140,6 +146,8 @@ def load_settings() -> Settings:
         openrouter_secondary_models=_csv("OPENROUTER_SECONDARY_MODEL_NAMES"),
         openrouter_temperature=_float("OPENROUTER_MODEL_TEMPERATURE", 0.1),
         allocation_mode=allocation,
+        investment_mode=investment_mode,
+        sip_monthly_amount=_float("MF_SIP_MONTHLY_AMOUNT", 0.0),
         horizon=horizon,
         policy=policy,
     )

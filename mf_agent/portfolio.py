@@ -317,3 +317,74 @@ def allocation_for_candidates(
         amc[fund.amc] += weight
 
     return selected
+
+
+
+def investment_option_status(
+    fund: FundRecord,
+    score: FundScore,
+    holdings: dict[str, Holding],
+    funds: list[FundRecord],
+    policy: PortfolioPolicy,
+    *,
+    one_time_allocated: bool,
+    investment_mode: str = "BOTH",
+) -> dict:
+    """Evaluate one-time and SIP routes independently.
+
+    One-time availability is tied to the current deployable-cash plan. SIP
+    availability is independent of today's deployable cash, but still obeys
+    the evidence and portfolio-capacity gates.
+    """
+    evidence_ok = score.allocation_eligible and score.evidence_status == "ELIGIBLE"
+    investment_mode = str(investment_mode or "BOTH").upper()
+    one_time_enabled = investment_mode in {"ONE_TIME", "BOTH"}
+    sip_enabled = investment_mode in {"SIP", "BOTH"}
+    exposure = existing_exposure(holdings, funds)
+    category = defaultdict(float, exposure["category_weights"])
+    amc = defaultdict(float, exposure["amc_weights"])
+    capacity = _candidate_capacity(fund, category, amc, policy)
+
+    if not evidence_ok:
+        reason = "Hard evidence gate is not satisfied."
+        return {
+            "one_time": {"eligible": False, "status": "BLOCKED", "reason": reason},
+            "sip": {"eligible": False, "status": "BLOCKED", "reason": reason},
+            "portfolio_capacity_pct": round(capacity, 2),
+        }
+
+    if capacity <= 0:
+        reason = "Portfolio category or AMC capacity is exhausted."
+        return {
+            "one_time": {"eligible": False, "status": "BLOCKED", "reason": reason},
+            "sip": {"eligible": False, "status": "BLOCKED", "reason": reason},
+            "portfolio_capacity_pct": 0.0,
+        }
+
+    return {
+        "one_time": {
+            "eligible": bool(one_time_enabled and one_time_allocated),
+            "status": (
+                "AVAILABLE"
+                if one_time_enabled and one_time_allocated
+                else "DISABLED" if not one_time_enabled else "NOT_ALLOCATED"
+            ),
+            "reason": (
+                "Fund is included in the current one-time deployable-cash plan."
+                if one_time_enabled and one_time_allocated
+                else "One-time investment is disabled by MF_INVESTMENT_MODE."
+                if not one_time_enabled
+                else "Fund is evidence-qualified but was not selected by the current one-time cash allocator."
+            ),
+        },
+        "sip": {
+            "eligible": sip_enabled,
+            "status": "AVAILABLE" if sip_enabled else "DISABLED",
+            "reason": (
+                "Fund is evidence-qualified and has portfolio capacity; SIP can be evaluated independently of today's deployable cash."
+                if sip_enabled
+                else "SIP is disabled by MF_INVESTMENT_MODE."
+            ),
+        },
+        "portfolio_capacity_pct": round(capacity, 2),
+    }

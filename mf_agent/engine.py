@@ -9,7 +9,7 @@ from .data import build_fund_universe, load_holdings
 from .embeddings import retrieve_relevant_funds, retrieve_relevant_news
 from .macro import fetch_macro_snapshot
 from .news import classify_event, fetch_news, filter_relevant_news
-from .portfolio import allocation_for_candidates, existing_exposure
+from .portfolio import allocation_for_candidates, existing_exposure, investment_option_status
 from .ranking import diversify_shortlist, rank_candidates
 from .regime import infer_regime
 from .scenarios import scenario_matrix
@@ -73,8 +73,14 @@ class ResearchEngine:
             and score.evidence_status == "ELIGIBLE"
         ]
 
+        allocation_candidates = (
+            candidates
+            if self.settings.investment_mode in {"ONE_TIME", "BOTH"}
+            else []
+        )
+
         allocations = allocation_for_candidates(
-            candidates,
+            allocation_candidates,
             holdings,
             funds,
             funds_info["deployable_cash"],
@@ -135,6 +141,34 @@ class ResearchEngine:
                 }
             )
 
+        # Evaluate SIP and one-time routes independently for every fund.
+        # One-time availability reflects the current deployable-cash plan.
+        # SIP availability does not depend on today's deployable cash.
+        for item in evaluated:
+            fund_record = next(
+                fund for fund, _score in scored
+                if fund.scheme_name == item["scheme_name"]
+            )
+            fund_score = next(
+                score for fund, score in scored
+                if fund.scheme_name == item["scheme_name"]
+            )
+            item["investment_options"] = investment_option_status(
+                fund_record,
+                fund_score,
+                holdings,
+                funds,
+                self.settings.policy,
+                one_time_allocated=item["scheme_name"] in allocation_map,
+                investment_mode=self.settings.investment_mode,
+            )
+            if item["scheme_name"] in allocation_map:
+                item["quantitative_investment_mode"] = "ONE_TIME"
+            elif item["investment_options"]["sip"]["eligible"]:
+                item["quantitative_investment_mode"] = "SIP"
+            else:
+                item["quantitative_investment_mode"] = "NEITHER"
+
         ranked_for_review = rank_candidates(
             evaluated,
             self.settings.ranking_limit,
@@ -172,7 +206,7 @@ class ResearchEngine:
         )
 
         return {
-            "engine_version": "2.3.0",
+            "engine_version": "2.4.0",
             "settings": {
                 "horizon": asdict(self.settings.horizon),
                 "investment_amount": float(
@@ -183,6 +217,8 @@ class ResearchEngine:
                 ),
                 "investor_age": self.settings.horizon.age,
                 "allocation_mode": self.settings.allocation_mode,
+                "investment_mode": self.settings.investment_mode,
+                "sip_monthly_amount": self.settings.sip_monthly_amount,
                 "policy": asdict(self.settings.policy),
             },
             "market": {
@@ -238,6 +274,16 @@ class ResearchEngine:
                         for x in evaluated
                         if x["score"].get("allocation_eligible", False)
                     ),
+                    "one_time_available": sum(
+                        1
+                        for x in evaluated
+                        if x.get("investment_options", {}).get("one_time", {}).get("eligible", False)
+                    ),
+                    "sip_available": sum(
+                        1
+                        for x in evaluated
+                        if x.get("investment_options", {}).get("sip", {}).get("eligible", False)
+                    ),
                     "insufficient_data": sum(
                         1
                         for x in evaluated
@@ -247,4 +293,5 @@ class ResearchEngine:
                 },
             },
             "allocation_plan": allocations,
+            "sip_recommendations": [],
         }
