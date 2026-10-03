@@ -298,14 +298,19 @@ def _write_kaggle_history_cache(settings: Settings, record: FundRecord, df: pd.D
         logger.debug("Could not cache Kaggle NAV history for %s: %s", record.scheme_name, exc)
 
 
-def _kaggle_file_columns(path: Path) -> tuple[list[str], str] | None:
+def _kaggle_file_columns(path: Path) -> tuple[list[str], str, str | None] | None:
     suffix = path.suffix.lower()
     try:
         if suffix in {".csv", ".tsv"}:
             sep = "\t" if suffix == ".tsv" else ","
-            return list(pd.read_csv(path, sep=sep, nrows=0).columns), sep
+            return list(pd.read_csv(path, sep=sep, nrows=0).columns), sep, None
         if suffix == ".parquet":
-            return list(pd.read_parquet(path, engine="auto").columns), "parquet"
+            # The Kaggle dataset stores Scheme_Code as the parquet index, so
+            # pandas exposes only Date/NAV in ``frame.columns``. Inspect the
+            # empty projection to recover the index name without loading the
+            # 100+ MB history twice.
+            frame = pd.read_parquet(path, columns=[], engine="auto")
+            return list(frame.columns), "parquet", frame.index.name
         return None
     except Exception as exc:
         logger.warning("Could not inspect Kaggle NAV file %s: %s", path, exc)
@@ -386,19 +391,41 @@ def _load_kaggle_histories(settings: Settings, records: list[FundRecord]) -> dic
         info = _kaggle_file_columns(path)
         if not info:
             continue
-        columns, sep = info
+        columns, sep, index_name = info
         code_col = _find_kaggle_column(columns, ("scheme code", "scheme_code", "amfi code", "amfi_code", "code"))
         name_col = _find_kaggle_column(columns, ("scheme name", "scheme_name", "fund name", "fund_name", "name"))
         date_col = _find_kaggle_column(columns, ("date", "nav date", "nav_date", "as of date"))
         nav_col = _find_kaggle_column(columns, ("nav", "net asset value", "net_asset_value", "net asset value rs"))
-        if not date_col or not nav_col or not (code_col or name_col):
-            logger.warning("Skipping Kaggle NAV file with unsupported schema: %s columns=%s", path, columns)
+
+        # mutual_fund_nav_history.parquet stores Scheme_Code as the pandas
+        # index. It therefore does not appear in ``frame.columns`` and the
+        # previous loader incorrectly rejected the file as Date/NAV-only.
+        parquet_index_code = sep == "parquet" and index_name is not None and not code_col and not name_col
+        if sep == "parquet" and not code_col and not name_col and not index_name and date_col and nav_col:
+            # Some parquet writers drop the index name. If the index itself
+            # contains one of the requested AMFI scheme codes, treat it as the
+            # scheme-code column rather than rejecting an otherwise valid NAV file.
+            try:
+                probe = pd.read_parquet(path, columns=[], engine="auto")
+                index_keys = {_kaggle_code_key(value) for value in probe.index[: min(len(probe.index), 10000)]}
+                parquet_index_code = bool(index_keys.intersection(targets_by_code))
+            except Exception:
+                parquet_index_code = False
+        if not date_col or not nav_col or not (code_col or name_col or parquet_index_code):
+            logger.warning("Skipping Kaggle NAV file with unsupported schema: %s columns=%s index=%s", path, columns, index_name)
             continue
 
         usecols = [column for column in (code_col, name_col, date_col, nav_col) if column]
         try:
             if sep == "parquet":
-                frame = pd.read_parquet(path, columns=usecols)
+                # Read the parquet once. If Scheme_Code is the index, reset it
+                # into a normal column so the existing matching pipeline can
+                # operate on both parquet-index and ordinary tabular schemas.
+                frame = pd.read_parquet(path, engine="auto")
+                if parquet_index_code:
+                    reset_code_col = index_name or "index"
+                    frame = frame.reset_index()
+                    code_col = reset_code_col
                 chunks = [frame]
             else:
                 chunks = pd.read_csv(path, sep=sep, usecols=usecols, chunksize=KAGGLE_NAV_CHUNK_SIZE)
