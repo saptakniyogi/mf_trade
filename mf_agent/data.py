@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import datetime as dt
 import hashlib
 import json
 import logging
@@ -262,74 +263,118 @@ def _performance_value(item: dict, direct_key: str) -> float | None:
     return safe_float(text)
 
 
-def _mftool_performance_cache_path(settings: Settings, method_name: str) -> Path:
+def _mftool_performance_cache_path(settings: Settings, method_name: str, report_date: str) -> Path:
     root = Path(settings.market_cache_dir) / "mftool_performance"
     root.mkdir(parents=True, exist_ok=True)
-    digest = hashlib.sha256(method_name.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(f"{method_name}:{report_date}".encode("utf-8")).hexdigest()
     return root / f"{digest}.json"
 
 
-def _read_mftool_performance_cache(settings: Settings, method_name: str):
-    path = _mftool_performance_cache_path(settings, method_name)
+def _read_mftool_performance_cache(settings: Settings, method_name: str, report_date: str):
+    path = _mftool_performance_cache_path(settings, method_name, report_date)
     try:
         if not path.exists():
             return None
         if time.time() - path.stat().st_mtime > MFTOOL_PERFORMANCE_CACHE_TTL_HOURS * 3600:
             return None
-        return json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        # Never reuse a cached empty AMFI performance response. Empty responses
+        # commonly occur when the requested date is an AMFI market holiday.
+        if not isinstance(payload, dict) or not any(isinstance(v, list) and v for v in payload.values()):
+            return None
+        return payload
     except Exception:
         return None
 
 
-def _write_mftool_performance_cache(settings: Settings, method_name: str, payload) -> None:
+def _write_mftool_performance_cache(settings: Settings, method_name: str, report_date: str, payload) -> None:
     try:
-        path = _mftool_performance_cache_path(settings, method_name)
+        if not isinstance(payload, dict) or not any(isinstance(v, list) and v for v in payload.values()):
+            return
+        path = _mftool_performance_cache_path(settings, method_name, report_date)
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         tmp.replace(path)
     except Exception as exc:
-        logger.debug("Could not cache mftool performance %s: %s", method_name, exc)
+        logger.debug("Could not cache mftool performance %s/%s: %s", method_name, report_date, exc)
+
+
+def _candidate_mftool_report_dates(max_days: int = 10) -> list[str]:
+    """Return recent weekdays so AMFI holidays can fall back to the prior trading day."""
+    today = dt.date.today()
+    dates = []
+    for offset in range(1, max_days + 1):
+        candidate = today - dt.timedelta(days=offset)
+        if candidate.weekday() < 5:
+            dates.append(candidate.strftime("%d-%b-%Y"))
+    return dates
 
 
 def _load_mftool_performance(mf: Mftool, settings: Settings, records: list[FundRecord]) -> dict[str, dict]:
-    """Load mftool's AMFI daily performance once per required fund category."""
+    """Load AMFI daily performance, falling back across recent weekdays.
+
+    mftool's default date logic assumes Friday is a valid trading day. That is
+    not true for Indian market holidays such as Gandhi Jayanti. We therefore
+    try recent weekdays explicitly and never cache an empty response.
+    """
     methods = {_performance_method_for_category(record.category) for record in records}
     by_name: dict[str, dict] = {}
 
     for method_name in sorted(methods):
-        try:
-            payload = _read_mftool_performance_cache(settings, method_name)
-            cache_hit = payload is not None
-            if payload is None:
-                method = getattr(mf, method_name)
-                payload = method()
-                if isinstance(payload, dict):
-                    _write_mftool_performance_cache(settings, method_name, payload)
+        loaded_for_method = False
+        for report_date in _candidate_mftool_report_dates():
+            try:
+                payload = _read_mftool_performance_cache(settings, method_name, report_date)
+                cache_hit = payload is not None
+                if payload is None:
+                    method = getattr(mf, method_name)
+                    payload = method(report_date=report_date)
 
-            if not isinstance(payload, dict):
-                logger.warning("mftool %s returned no structured performance data", method_name)
-                continue
-
-            count = 0
-            for _, items in payload.items():
-                if not isinstance(items, list):
+                if not isinstance(payload, dict):
                     continue
-                for item in items:
-                    if not isinstance(item, dict) or not item.get("scheme_name"):
+
+                items_found = 0
+                for _, items in payload.items():
+                    if not isinstance(items, list):
                         continue
-                    by_name[_normalise_scheme_name(item["scheme_name"])] = item
-                    count += 1
-            logger.info(
-                "mftool performance loaded: %s -> %d schemes; cache_hit=%s",
+                    for item in items:
+                        if not isinstance(item, dict) or not item.get("scheme_name"):
+                            continue
+                        by_name[_normalise_scheme_name(item["scheme_name"])] = item
+                        items_found += 1
+
+                if items_found:
+                    _write_mftool_performance_cache(settings, method_name, report_date, payload)
+                    logger.info(
+                        "mftool performance loaded: %s -> %d schemes; report_date=%s; cache_hit=%s",
+                        method_name,
+                        items_found,
+                        report_date,
+                        cache_hit,
+                    )
+                    loaded_for_method = True
+                    break
+
+                logger.info(
+                    "mftool performance empty: %s; report_date=%s; trying previous weekday",
+                    method_name,
+                    report_date,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "mftool performance failed for %s on %s: %s",
+                    method_name,
+                    report_date,
+                    exc,
+                )
+
+        if not loaded_for_method:
+            logger.warning(
+                "mftool performance unavailable: %s; no non-empty AMFI report found in recent weekdays",
                 method_name,
-                count,
-                cache_hit,
             )
-        except Exception as exc:
-            logger.warning("mftool performance failed for %s: %s", method_name, exc)
 
     return by_name
-
 
 def _enrich_from_mftool_performance(records: list[FundRecord], performance: dict[str, dict]) -> None:
     """Fill direct-plan returns and benchmark from mftool's AMFI performance reports."""
