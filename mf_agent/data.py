@@ -5,8 +5,9 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
-from datetime import timedelta
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import pandas as pd
@@ -21,6 +22,24 @@ from .models import FundRecord, Holding
 from .utils import safe_float
 
 logger = logging.getLogger("mf_agent")
+
+try:
+    _MFTOOL_VERSION = version("mftool")
+except PackageNotFoundError:
+    _MFTOOL_VERSION = "not-installed"
+logger.info("mftool dependency loaded: version=%s", _MFTOOL_VERSION)
+
+
+_MFTOOL_LOCAL = threading.local()
+
+
+def _thread_mftool() -> Mftool:
+    """Return one mftool instance per worker thread to avoid sharing sessions."""
+    instance = getattr(_MFTOOL_LOCAL, "instance", None)
+    if instance is None:
+        instance = Mftool()
+        _MFTOOL_LOCAL.instance = instance
+    return instance
 
 CATEGORY_RULES = [
     ("Flexi Cap", ["flexi cap", "flexicap"]),
@@ -45,16 +64,7 @@ MFDATA_FAMILY_ENRICHMENT_LIMIT = max(0, int(os.getenv("MF_DATA_FAMILY_ENRICHMENT
 MFDATA_TIMEOUT_SECONDS = max(2, int(os.getenv("MF_DATA_TIMEOUT_SECONDS", "5")))
 MFDATA_BULK_CHUNK_SIZE = max(25, min(100, int(os.getenv("MF_DATA_BULK_CHUNK_SIZE", "50"))))
 MFDATA_INDIVIDUAL_FALLBACK_LIMIT = max(0, int(os.getenv("MF_DATA_INDIVIDUAL_FALLBACK_LIMIT", "3")))
-
-# mfdata.in is a rich, optional enrichment provider. Historical NAVs are sourced
-# independently so a failure of that provider cannot erase the core performance
-# and risk metrics needed by the ranking engine. mfapi.in republishes AMFI NAV
-# history and requires no API key.
-MF_NAV_API_BASE_URL = os.getenv("MF_NAV_API_BASE_URL", "https://api.mfapi.in/mf").rstrip("/")
-MF_NAV_TIMEOUT_SECONDS = max(2, int(os.getenv("MF_NAV_TIMEOUT_SECONDS", "5")))
-MF_NAV_CACHE_TTL_HOURS = max(1.0, float(os.getenv("MF_NAV_CACHE_TTL_HOURS", "24")))
-MF_NAV_MAX_WORKERS = max(1, min(12, int(os.getenv("MF_NAV_MAX_WORKERS", "6"))))
-
+MFTOOL_PERFORMANCE_CACHE_TTL_HOURS = max(1.0, float(os.getenv("MFTOOL_PERFORMANCE_CACHE_TTL_HOURS", "24")))
 
 def classify_category(name: str) -> str:
     lower = name.lower()
@@ -133,7 +143,7 @@ def _parse_nav_history_rows(rows) -> pd.DataFrame:
 
 
 def _calculate_nav_metrics(df: pd.DataFrame) -> dict:
-    """Calculate performance and risk metrics from daily NAV observations."""
+    """Calculate CAGR and risk metrics from an AMFI NAV history."""
     if df.empty or len(df) < 2:
         return {}
 
@@ -155,170 +165,206 @@ def _calculate_nav_metrics(df: pd.DataFrame) -> dict:
         if old > 0 and latest > 0:
             result[f"cagr_{years}y_pct"] = round(((latest / old) ** (1 / years) - 1) * 100, 2)
 
-    returns = df["nav"].pct_change().dropna()
-    if not returns.empty:
-        daily_std = float(returns.std(ddof=1)) if len(returns) > 1 else 0.0
-        annualized_vol = daily_std * (252 ** 0.5) * 100 if daily_std > 0 else 0.0
-        result["volatility_pct"] = round(annualized_vol, 2)
+    # Risk statistics describe the recent risk regime rather than the fund's
+    # entire lifetime. Use one year of NAV history where available.
+    risk_start = latest_date - pd.Timedelta(days=365.25)
+    risk_df = df[df["date"] >= risk_start].copy()
+    if len(risk_df) < 30:
+        risk_df = df.copy()
 
+    returns = risk_df["nav"].pct_change().dropna()
+    if len(returns) >= 2:
+        daily_std = float(returns.std(ddof=1))
         if daily_std > 0:
+            result["volatility_pct"] = round(daily_std * (252 ** 0.5) * 100, 2)
             result["sharpe"] = round(float(returns.mean()) / daily_std * (252 ** 0.5), 3)
 
-        downside = returns[returns < 0]
-        downside_std = float(downside.std(ddof=1)) if len(downside) > 1 else 0.0
-        if downside_std > 0:
-            result["sortino"] = round(float(returns.mean()) / downside_std * (252 ** 0.5), 3)
+            downside = returns[returns < 0]
+            if len(downside) >= 2:
+                downside_std = float(downside.std(ddof=1))
+                if downside_std > 0:
+                    result["sortino"] = round(float(returns.mean()) / downside_std * (252 ** 0.5), 3)
 
-        running_peak = df["nav"].cummax()
-        drawdowns = (df["nav"] / running_peak - 1.0) * 100.0
+        running_peak = risk_df["nav"].cummax()
+        drawdowns = (risk_df["nav"] / running_peak - 1.0) * 100.0
         result["max_drawdown_pct"] = round(float(drawdowns.min()), 2)
 
     return result
 
 
 def _historical_metrics(mf: Mftool, code: str) -> dict:
-    """Read historical NAV through mftool when available."""
+    """Calculate risk metrics from mftool's AMFI historical NAV series."""
+    if not code:
+        return {}
     try:
         raw = mf.get_scheme_historical_nav(code)
         rows = raw.get("data", []) if isinstance(raw, dict) else []
         df = _parse_nav_history_rows(rows)
-        return _calculate_nav_metrics(df)
+        metrics = _calculate_nav_metrics(df)
+        if metrics:
+            metrics["data_source"] = "mftool / AMFI NAV history"
+        return metrics
     except Exception as exc:
-        logger.debug("Historical NAV failed for %s: %s", code, exc)
+        logger.warning("mftool historical NAV failed for %s: %s", code, exc)
         return {}
 
 
-def _nav_cache_path(settings: Settings, code: str) -> Path:
-    root = Path(settings.market_cache_dir) / "nav_history"
+def _normalise_scheme_name(name: str) -> str:
+    """Normalize AMFI and mftool performance names for reliable matching."""
+    value = " ".join(str(name or "").lower().replace("&", "and").split())
+    replacements = [
+        "- direct plan - growth option",
+        "- direct plan - growth",
+        "- direct plan growth option",
+        "- direct plan growth",
+        "- direct growth option",
+        "- direct growth",
+        "direct plan - growth option",
+        "direct plan - growth",
+        "direct plan growth option",
+        "direct plan growth",
+        "direct growth option",
+        "direct growth",
+        "- growth option",
+        "- growth",
+        "growth option",
+        "growth",
+    ]
+    for suffix in replacements:
+        if value.endswith(suffix):
+            value = value[: -len(suffix)].rstrip(" -")
+            break
+    return value
+
+
+def _performance_method_for_category(category: str) -> str:
+    value = str(category or "").lower()
+    if any(token in value for token in (
+        "debt", "bond", "liquid", "overnight", "gilt", "duration", "credit",
+    )):
+        return "get_open_ended_debt_scheme_performance"
+    if any(token in value for token in ("hybrid", "balanced advantage", "aggressive hybrid")):
+        return "get_open_ended_hybrid_scheme_performance"
+    if any(token in value for token in ("solution", "retirement", "children")):
+        return "get_open_ended_solution_scheme_performance"
+    if any(token in value for token in ("index", "fund of fund", "fof")):
+        return "get_open_ended_other_scheme_performance"
+    return "get_open_ended_equity_scheme_performance"
+
+
+def _performance_value(item: dict, direct_key: str) -> float | None:
+    value = item.get(direct_key)
+    if value is None:
+        return None
+    text = str(value).strip().replace("%", "")
+    if text in {"", "-", "--", "NA", "N/A", "None"}:
+        return None
+    return safe_float(text)
+
+
+def _mftool_performance_cache_path(settings: Settings, method_name: str) -> Path:
+    root = Path(settings.market_cache_dir) / "mftool_performance"
     root.mkdir(parents=True, exist_ok=True)
-    digest = hashlib.sha256(f"{MF_NAV_API_BASE_URL}/{code}".encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(method_name.encode("utf-8")).hexdigest()
     return root / f"{digest}.json"
 
 
-def _read_nav_cache(settings: Settings, code: str):
-    path = _nav_cache_path(settings, code)
+def _read_mftool_performance_cache(settings: Settings, method_name: str):
+    path = _mftool_performance_cache_path(settings, method_name)
     try:
         if not path.exists():
             return None
-        age = time.time() - path.stat().st_mtime
-        if age > MF_NAV_CACHE_TTL_HOURS * 3600:
+        if time.time() - path.stat().st_mtime > MFTOOL_PERFORMANCE_CACHE_TTL_HOURS * 3600:
             return None
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
 
 
-def _write_nav_cache(settings: Settings, code: str, payload) -> None:
+def _write_mftool_performance_cache(settings: Settings, method_name: str, payload) -> None:
     try:
-        path = _nav_cache_path(settings, code)
+        path = _mftool_performance_cache_path(settings, method_name)
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         tmp.replace(path)
     except Exception as exc:
-        logger.debug("Could not cache NAV history for %s: %s", code, exc)
+        logger.debug("Could not cache mftool performance %s: %s", method_name, exc)
 
 
-def _fetch_nav_history(settings: Settings, code: str) -> dict:
-    """Fetch one scheme's full NAV history from the independent AMFI-derived API."""
-    cached = _read_nav_cache(settings, code)
-    if cached is not None:
-        return cached
+def _load_mftool_performance(mf: Mftool, settings: Settings, records: list[FundRecord]) -> dict[str, dict]:
+    """Load mftool's AMFI daily performance once per required fund category."""
+    methods = {_performance_method_for_category(record.category) for record in records}
+    by_name: dict[str, dict] = {}
 
-    url = f"{MF_NAV_API_BASE_URL}/{code}"
-    try:
-        response = requests.get(
-            url,
-            timeout=MF_NAV_TIMEOUT_SECONDS,
-            headers={
-                "User-Agent": "MF Research Dashboard/2.4",
-                "Accept": "application/json",
-            },
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if isinstance(payload, dict) and isinstance(payload.get("data"), list):
-            _write_nav_cache(settings, code, payload)
-            return payload
-        logger.debug("NAV provider returned no history for %s", code)
-    except (requests.exceptions.RequestException, ValueError) as exc:
-        logger.debug("Independent NAV history failed for %s: %s", code, exc)
-    return {}
+    for method_name in sorted(methods):
+        try:
+            payload = _read_mftool_performance_cache(settings, method_name)
+            cache_hit = payload is not None
+            if payload is None:
+                method = getattr(mf, method_name)
+                payload = method()
+                if isinstance(payload, dict):
+                    _write_mftool_performance_cache(settings, method_name, payload)
 
+            if not isinstance(payload, dict):
+                logger.warning("mftool %s returned no structured performance data", method_name)
+                continue
 
-def _enrich_from_nav_api(settings: Settings, records: list[FundRecord]) -> None:
-    """Fill missing performance/risk metrics from independent AMFI-derived NAV history."""
-    targets = [
-        record
-        for record in records
-        if record.scheme_code
-        and any(
-            getattr(record, field) is None
-            for field in (
-                "cagr_1y_pct",
-                "cagr_3y_pct",
-                "cagr_5y_pct",
-                "volatility_pct",
-                "max_drawdown_pct",
-                "sharpe",
-                "sortino",
-            )
-        )
-    ]
-    if not targets:
-        return
-
-    def load(record: FundRecord):
-        return record, _fetch_nav_history(settings, record.scheme_code)
-
-    completed = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MF_NAV_MAX_WORKERS) as pool:
-        futures = [pool.submit(load, record) for record in targets]
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                record, payload = future.result()
-                data_rows = payload.get("data", []) if isinstance(payload, dict) else []
-                df = _parse_nav_history_rows(data_rows)
-                metrics = _calculate_nav_metrics(df)
-                if not metrics:
+            count = 0
+            for _, items in payload.items():
+                if not isinstance(items, list):
                     continue
+                for item in items:
+                    if not isinstance(item, dict) or not item.get("scheme_name"):
+                        continue
+                    by_name[_normalise_scheme_name(item["scheme_name"])] = item
+                    count += 1
+            logger.info(
+                "mftool performance loaded: %s -> %d schemes; cache_hit=%s",
+                method_name,
+                count,
+                cache_hit,
+            )
+        except Exception as exc:
+            logger.warning("mftool performance failed for %s: %s", method_name, exc)
 
-                changed = False
-                for field in (
-                    "cagr_1y_pct",
-                    "cagr_3y_pct",
-                    "cagr_5y_pct",
-                    "volatility_pct",
-                    "max_drawdown_pct",
-                    "sharpe",
-                    "sortino",
-                ):
-                    if getattr(record, field) is None and metrics.get(field) is not None:
-                        setattr(record, field, metrics[field])
-                        record.data_sources[field] = "mfapi.in / AMFI NAV history"
-                        changed = True
+    return by_name
 
-                if record.latest_nav is None and metrics.get("latest_nav") is not None:
-                    record.latest_nav = metrics["latest_nav"]
-                    record.data_sources["latest_nav"] = "mfapi.in / AMFI NAV history"
-                    changed = True
-                if not record.nav_date and metrics.get("nav_date"):
-                    record.nav_date = metrics["nav_date"]
-                    record.data_sources["nav_date"] = "mfapi.in / AMFI NAV history"
-                    changed = True
-                if changed:
-                    record.data_sources["nav_history"] = "mfapi.in / AMFI NAV history"
-                    record.nav_history_observations = metrics.get("nav_history_observations")
-                    record.source_quality = max(record.source_quality, 0.90)
-                    completed += 1
-            except Exception as exc:
-                logger.debug("NAV enrichment failed for a fund: %s", exc)
 
-    logger.info(
-        "Independent NAV enrichment: %d/%d funds received historical evidence; cache TTL=%sh.",
-        completed,
-        len(targets),
-        MF_NAV_CACHE_TTL_HOURS,
-    )
+def _enrich_from_mftool_performance(records: list[FundRecord], performance: dict[str, dict]) -> None:
+    """Fill direct-plan returns and benchmark from mftool's AMFI performance reports."""
+    matched = 0
+    for record in records:
+        item = performance.get(_normalise_scheme_name(record.scheme_name))
+        if not item:
+            continue
+        changed = False
+        for field, key in (
+            ("cagr_1y_pct", "1-Year Return(%)- Direct"),
+            ("cagr_3y_pct", "3-Year Return(%)- Direct"),
+            ("cagr_5y_pct", "5-Year Return(%)- Direct"),
+        ):
+            value = _performance_value(item, key)
+            if value is not None and (
+                getattr(record, field) is None
+                or record.data_sources.get(field) == "mftool / AMFI NAV history"
+            ):
+                setattr(record, field, value)
+                record.data_sources[field] = "mftool / AMFI daily performance"
+                changed = True
+
+        benchmark = item.get("benchmark")
+        if not record.benchmark and benchmark and str(benchmark).strip() not in {"-", "NA", "N/A"}:
+            record.benchmark = str(benchmark).strip()
+            record.data_sources["benchmark"] = "mftool / AMFI daily performance"
+            changed = True
+
+        if changed:
+            record.source_quality = max(record.source_quality, 0.90)
+            matched += 1
+
+    logger.info("mftool performance enrichment: matched %d/%d funds.", matched, len(records))
+
 
 
 def _make_session() -> requests.Session:
@@ -661,13 +707,34 @@ def _fund_record(mf: Mftool, item: dict, holdings: dict[str, Holding]) -> FundRe
             quote = mf.get_scheme_quote(code) or {}
             details = mf.get_scheme_details(code) or {}
         except Exception as exc:
-            logger.debug("mftool quote/details failed for %s: %s", name, exc)
+            logger.warning("mftool quote/details failed for %s (%s): %s", name, code, exc)
 
     hist = _historical_metrics(mf, code) if code else {}
     category = details.get("scheme_category") or item.get("category") or classify_category(name)
     amc = details.get("fund_house") or item.get("amc") or "Unknown"
     nav = safe_float(quote.get("nav"))
     nav_date = quote.get("last_updated")
+    inception = details.get("scheme_start_date")
+    if isinstance(inception, dict):
+        inception = inception.get("date")
+    elif inception is not None:
+        inception = str(inception)
+
+    sources = {}
+    if nav is not None:
+        sources["latest_nav"] = "mftool / AMFI quote"
+    if nav_date:
+        sources["nav_date"] = "mftool / AMFI quote"
+    if details:
+        sources["scheme_metadata"] = "mftool / AMFI scheme details"
+    if inception:
+        sources["inception_date"] = "mftool / AMFI scheme details"
+    for field in (
+        "cagr_1y_pct", "cagr_3y_pct", "cagr_5y_pct", "volatility_pct",
+        "max_drawdown_pct", "sharpe", "sortino",
+    ):
+        if hist.get(field) is not None:
+            sources[field] = "mftool / AMFI NAV history"
 
     return FundRecord(
         scheme_name=name,
@@ -676,10 +743,18 @@ def _fund_record(mf: Mftool, item: dict, holdings: dict[str, Holding]) -> FundRe
         amc=amc,
         latest_nav=nav,
         nav_date=nav_date,
+        inception_date=inception,
         cagr_1y_pct=hist.get("cagr_1y_pct"),
         cagr_3y_pct=hist.get("cagr_3y_pct"),
         cagr_5y_pct=hist.get("cagr_5y_pct"),
+        volatility_pct=hist.get("volatility_pct"),
+        max_drawdown_pct=hist.get("max_drawdown_pct"),
+        sharpe=hist.get("sharpe"),
+        sortino=hist.get("sortino"),
         benchmark=None,
+        source_quality=0.90 if hist else 0.75,
+        data_sources=sources,
+        nav_history_observations=hist.get("nav_history_observations"),
     )
 
 
@@ -726,6 +801,7 @@ def load_optional_factsheet_data(settings: Settings, scheme_name: str) -> dict:
 
 
 def build_fund_universe(settings: Settings, holdings: dict[str, Holding]) -> list[FundRecord]:
+    logger.info("Initializing mftool/AMFI data provider: version=%s", _MFTOOL_VERSION)
     mf = Mftool()
     raw = fetch_universe(settings, mf)
     for name in holdings:
@@ -733,36 +809,47 @@ def build_fund_universe(settings: Settings, holdings: dict[str, Holding]) -> lis
             raw.append({"scheme_name": name, "category": "Holding Scheme", "amc": "Unknown", "code": ""})
 
     records: list[FundRecord] = []
+
+    def build_record(item: dict) -> FundRecord:
+        # Each worker gets its own Mftool requests session. Sharing one Mftool
+        # instance across threads can cause intermittent quote/history failures.
+        worker_mf = _thread_mftool()
+        record = _fund_record(worker_mf, item, holdings)
+        extra = load_optional_factsheet_data(settings, record.scheme_name)
+        for key in ("aum_inr_cr", "inception_date", "volatility_pct", "max_drawdown_pct", "sharpe", "sortino", "benchmark"):
+            if key in extra and extra[key] is not None:
+                setattr(record, key, extra[key])
+                record.data_sources[key] = "local factsheet"
+                record.source_quality = max(record.source_quality, 0.95)
+        for key in ("sector_weights", "holdings", "market_cap_weights", "valuation"):
+            if isinstance(extra.get(key), dict) and extra[key]:
+                setattr(record, key, extra[key])
+                record.data_sources[key] = "local factsheet"
+                record.source_quality = max(record.source_quality, 0.95)
+        return record
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
-        futures = [pool.submit(_fund_record, mf, item, holdings) for item in raw]
+        futures = [pool.submit(build_record, item) for item in raw]
         for future in concurrent.futures.as_completed(futures):
             try:
-                record = future.result()
-                extra = load_optional_factsheet_data(settings, record.scheme_name)
-                for key in ("aum_inr_cr", "inception_date", "volatility_pct", "max_drawdown_pct", "sharpe", "sortino", "benchmark"):
-                    if key in extra and extra[key] is not None:
-                        setattr(record, key, extra[key])
-                        record.source_quality = max(record.source_quality, 0.95)
-                for key in ("sector_weights", "holdings", "market_cap_weights", "valuation"):
-                    if isinstance(extra.get(key), dict) and extra[key]:
-                        setattr(record, key, extra[key])
-                        record.source_quality = max(record.source_quality, 0.95)
-                records.append(record)
+                records.append(future.result())
             except Exception as exc:
                 logger.warning("Fund processing failed: %s", exc)
 
     records.sort(key=lambda x: (x.category.lower(), x.scheme_name.lower()))
 
+    # mftool exposes AMFI's daily direct-plan 1Y/3Y/5Y performance and benchmark
+    # directly. This is more authoritative for these fields than deriving returns
+    # from a second NAV provider.
+    try:
+        performance = _load_mftool_performance(mf, settings, records)
+        _enrich_from_mftool_performance(records, performance)
+    except Exception as exc:
+        logger.warning("mftool performance enrichment failed: %s", exc)
+
     try:
         _enrich_from_mfdata(settings, records, holdings)
     except Exception as exc:
-        logger.warning("mfdata enrichment failed; continuing with fallback data: %s", exc)
-
-    # Historical NAV evidence is independent of mfdata. Run it after the rich
-    # provider so it only fills missing metrics and never overwrites better data.
-    try:
-        _enrich_from_nav_api(settings, records)
-    except Exception as exc:
-        logger.warning("Independent NAV enrichment failed; continuing with available data: %s", exc)
+        logger.warning("mfdata enrichment failed; continuing with mftool/AMFI data: %s", exc)
 
     return records
