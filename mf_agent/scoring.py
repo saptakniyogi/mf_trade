@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .analytics import fund_data_quality, fund_quality_score, holdings_overlap, risk_adjusted_score
+from .analytics import fund_quality_score, holdings_overlap, risk_adjusted_score
 from .models import FundRecord, Holding, MarketRegime, FundScore
 from .utils import clamp, normalize
 
@@ -31,6 +31,56 @@ def _macro_resilience(fund: FundRecord, regime: MarketRegime) -> float:
     return clamp(score)
 
 
+def _data_confidence(fund: FundRecord) -> float:
+    """Evidence completeness, not investment quality.
+
+    Equity-like funds get credit for holdings/sector/market-cap/valuation evidence.
+    Debt/hybrid funds are not penalized for equity-only market-cap data when it is not
+    applicable. The score intentionally measures evidence availability only.
+    """
+    category = fund.category.lower()
+    debt_like = any(x in category for x in ("debt", "liquid", "overnight", "money market", "gilt", "duration", "bond", "credit risk"))
+    checks: list[tuple[bool, float]] = [
+        (fund.cagr_1y_pct is not None, 10),
+        (fund.cagr_3y_pct is not None, 10),
+        (fund.cagr_5y_pct is not None, 10),
+        (fund.sharpe is not None or fund.sortino is not None, 10),
+        (fund.volatility_pct is not None, 5),
+        (fund.max_drawdown_pct is not None, 10),
+        (fund.aum_inr_cr is not None, 5),
+        (fund.benchmark is not None, 5),
+        (bool(fund.valuation), 10),
+        (bool(fund.holdings), 15),
+        (bool(fund.sector_weights) if not debt_like else True, 5),
+        (bool(fund.market_cap_weights) if not debt_like else True, 5),
+    ]
+    total = sum(weight for _, weight in checks)
+    available = sum(weight for ok, weight in checks if ok)
+    return round(100 * available / total, 1) if total else 0.0
+
+
+def _portfolio_fit(
+    fund: FundRecord,
+    holdings: dict[str, Holding],
+    all_funds: list[FundRecord],
+) -> tuple[float | None, float, bool]:
+    """Return fit, max overlap, and whether fit evidence is available."""
+    if not fund.holdings:
+        return None, 0.0, False
+
+    overlaps = []
+    for held_name in holdings:
+        existing = next((x for x in all_funds if x.scheme_name.lower() == held_name.lower()), None)
+        if existing and existing.holdings:
+            overlaps.append(holdings_overlap(fund.holdings, existing.holdings))
+
+    max_overlap = max(overlaps) if overlaps else 0.0
+    fit = clamp(95 - max_overlap * 0.65)
+    if any(fund.scheme_name.lower() == name.lower() for name in holdings):
+        fit = clamp(fit + 5)
+    return round(fit, 2), max_overlap, True
+
+
 def score_fund(
     fund: FundRecord,
     holdings: dict[str, Holding],
@@ -39,56 +89,59 @@ def score_fund(
 ) -> FundScore:
     quality, positive, warnings = fund_quality_score(fund)
     risk = risk_adjusted_score(fund)
+    # risk_adjusted_score historically returned 50 when no evidence existed. Treat
+    # that as unknown here so missing data cannot create artificial support.
+    risk_available = any(
+        x is not None
+        for x in (fund.sharpe, fund.sortino, fund.max_drawdown_pct, fund.volatility_pct)
+    )
+    risk_value = risk if risk_available else None
+
     valuation = _valuation_score(fund)
     macro = _macro_resilience(fund, regime)
-    data_confidence, completeness_warnings = fund_data_quality(fund)
-    warnings.extend(completeness_warnings)
+    fit, max_overlap, fit_available = _portfolio_fit(fund, holdings, all_funds)
 
-    overlaps = []
-    for held_name, _holding in holdings.items():
-        existing = next((x for x in all_funds if x.scheme_name.lower() == held_name.lower()), None)
-        if existing and existing.holdings and fund.holdings:
-            overlaps.append(holdings_overlap(fund.holdings, existing.holdings))
-    max_overlap = max(overlaps) if overlaps else None
-
-    # Portfolio fit is UNKNOWN when there is no holdings evidence. A score of
-    # 95 in that situation was misleading because it implied measured fit.
-    fit = None
-    if fund.holdings:
-        fit = clamp(95 - (max_overlap or 0.0) * 0.65)
-        if fund.scheme_name in holdings:
-            fit = clamp(fit + 5)
+    if valuation is not None and risk_value is not None:
+        attractiveness = clamp(0.45 * valuation + 0.30 * macro + 0.25 * risk_value)
+    elif valuation is not None:
+        attractiveness = clamp(0.60 * valuation + 0.40 * macro)
+    elif risk_value is not None:
+        attractiveness = clamp(0.55 * macro + 0.45 * risk_value)
     else:
-        warnings.append("Portfolio fit is unknown because underlying holdings are unavailable.")
+        attractiveness = macro
 
-    available = []
-    if valuation is not None:
-        available.append((0.45, valuation))
-    if risk is not None:
-        available.append((0.25, risk))
-    available.append((0.30, macro))
-    weight_sum = sum(weight for weight, _ in available)
-    attractiveness = clamp(sum(weight * value for weight, value in available) / max(weight_sum, 1e-9))
-
-    components = [
-        (0.35, quality),
-        (0.20, risk),
-        (0.20, attractiveness),
-        (0.15, fit),
-        (0.10, macro),
+    components: list[tuple[float, float]] = [
+        (quality, 0.35),
+        (attractiveness, 0.20),
+        (macro, 0.10),
     ]
-    used = [(weight, value) for weight, value in components if value is not None]
-    overall = round(sum(weight * value for weight, value in used) / max(sum(weight for weight, _ in used), 1e-9), 2)
+    if risk_value is not None:
+        components.append((risk_value, 0.20))
+    if fit is not None:
+        components.append((fit, 0.15))
 
-    # Confidence-aware ranking prevents high-return but poorly evidenced funds
-    # from dominating the local shortlist. Keep the raw score intact for audit.
-    confidence_factor = 0.55 + 0.45 * (data_confidence / 100.0)
-    ranking_score = round(overall * confidence_factor, 2)
+    weight_sum = sum(weight for _, weight in components)
+    overall = round(sum(value * weight for value, weight in components) / weight_sum, 2)
 
-    if max_overlap is not None and max_overlap > 60:
+    if max_overlap > 60:
         warnings.append(f"High overlap with an existing holding: {max_overlap:.1f}%.")
     if regime.overall == "DEFENSIVE" and "small" in fund.category.lower():
         warnings.append("Small-cap exposure is less resilient under the current defensive regime.")
+    if not fund.holdings:
+        warnings.append("Underlying holdings are unavailable, so overlap and factor analysis are incomplete.")
+    if valuation is None:
+        warnings.append("Valuation data unavailable.")
+    if fund.benchmark is None:
+        warnings.append("Benchmark unavailable.")
+    if fund.aum_inr_cr is None:
+        warnings.append("AUM unavailable.")
+    if not fund.sector_weights and "debt" not in fund.category.lower():
+        warnings.append("Sector weights unavailable.")
+    if not fund.market_cap_weights and "debt" not in fund.category.lower():
+        warnings.append("Market-cap weights unavailable.")
+
+    data_confidence = _data_confidence(fund)
+    ranking_score = round(overall * (0.55 + 0.45 * data_confidence / 100.0), 2)
 
     not_buy = []
     if valuation is not None and valuation < 35:
@@ -97,14 +150,17 @@ def score_fund(
         not_buy.append("Portfolio fit is weak because of overlap or concentration.")
     if macro < 45:
         not_buy.append("Current macro regime is unfavorable for this fund's category/exposure.")
-    if risk is None:
-        not_buy.append("Risk-adjusted metrics are unavailable, so the return profile cannot be validated.")
-    if data_confidence < 50:
+    if data_confidence < 60:
         not_buy.append("Data confidence is low; the quantitative ranking should be treated as provisional.")
+    if risk_value is None:
+        not_buy.append("Risk-adjusted metrics are unavailable, so the return profile cannot be validated.")
+
+    # Deduplicate warnings while preserving order.
+    warnings = list(dict.fromkeys(warnings))
 
     return FundScore(
         fund_quality=round(quality, 2),
-        risk_adjusted_return=round(risk, 2) if risk is not None else None,
+        risk_adjusted_return=round(risk_value, 2) if risk_value is not None else None,
         current_attractiveness=round(attractiveness, 2),
         portfolio_fit=round(fit, 2) if fit is not None else None,
         valuation=round(valuation, 2) if valuation is not None else None,

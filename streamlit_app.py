@@ -31,13 +31,6 @@ CURRENT_LOG_PATH = LOG_DIR / "mf_agent_latest.log"
 LOG_DIR.mkdir(exist_ok=True)
 
 
-# Streamlit page configuration must be the first Streamlit command.
-st.set_page_config(
-    page_title="Mutual Fund Research Dashboard",
-    page_icon="📊",
-    layout="wide",
-)
-
 # ---------------------------------------------------------------------------
 # Streamlit session state
 # ---------------------------------------------------------------------------
@@ -114,38 +107,6 @@ def score_fmt(value):
     if value is None:
         return "—"
     return f"{value:.1f}"
-
-
-def display_value(value, suffix=""):
-    """Render missing numeric data explicitly instead of showing blank cells."""
-    if value is None or value == "":
-        return "Unavailable"
-    try:
-        return f"{float(value):.2f}{suffix}"
-    except (TypeError, ValueError):
-        return str(value)
-
-
-def allocation_reason(item):
-    """Return the most useful available explanation for an allocation."""
-    review = item.get("llm_review") or {}
-    final_comment = review.get("final_comment")
-    if final_comment:
-        return final_comment
-
-    reasons = review.get("key_reasons") or []
-    if reasons:
-        return reasons[0]
-
-    reasons = item.get("reasons_to_buy") or []
-    if reasons:
-        return reasons[0]
-
-    reason = item.get("reason")
-    if reason:
-        return reason
-
-    return "Selected by the quantitative allocation engine based on score and portfolio constraints."
 
 
 def load_result():
@@ -493,6 +454,12 @@ def run_engine():
 # ---------------------------------------------------------------------------
 # Page
 # ---------------------------------------------------------------------------
+
+st.set_page_config(
+    page_title="Mutual Fund Research Dashboard",
+    page_icon="📊",
+    layout="wide",
+)
 
 st.title("📊 Mutual Fund Research Dashboard")
 
@@ -1150,92 +1117,69 @@ with tab_overview:
     if allocation:
         allocation_rows = []
         for item in allocation:
+            warnings = item.get("data_warnings") or []
+            llm_review = item.get("llm_review") or {}
+            reason = item.get("reason") or "Selected by the quantitative allocation engine."
+            if len(reason) > 240:
+                reason = reason[:237] + "..."
             raw_score = item.get("score")
-            score = raw_score if isinstance(raw_score, dict) else {}
-            review = item.get("llm_review") or {}
-            warnings = item.get("data_warnings") or score.get("data_warnings") or []
-            overall_score = score.get("overall") if score else raw_score
-
-            allocation_rows.append(
-                {
-                    "Fund": item.get("scheme_name") or item.get("fund"),
-                    "Category": item.get("category"),
-                    "AMC": item.get("amc"),
-                    "Action": item.get("final_action") or item.get("action"),
-                    "Allocation %": item.get("allocation_pct"),
-                    "Capital": money(item.get("capital_required")),
-                    "Score": overall_score,
-                    "Data confidence": score.get("data_confidence", item.get("data_confidence")),
-                    "Reason": allocation_reason(item),
-                    "Data gaps": "; ".join(str(x) for x in warnings) if warnings else "None reported",
-                    "LLM": "Reviewed" if review else "Not reviewed",
-                }
-            )
+            if isinstance(raw_score, dict):
+                display_score = raw_score.get("ranking_score", raw_score.get("overall"))
+            else:
+                display_score = raw_score
+            allocation_rows.append({
+                "Fund": item.get("scheme_name"),
+                "Category": item.get("category"),
+                "AMC": item.get("amc"),
+                "Action": item.get("final_action", item.get("action")),
+                "Allocation %": item.get("allocation_pct_of_new_cash"),
+                "Capital": money(item.get("capital_required")),
+                "Score": display_score,
+                "Data confidence": item.get("data_confidence"),
+                "Reason": reason,
+                "Data gaps": len(warnings),
+                "LLM": "Reviewed" if llm_review else "Not reviewed",
+            })
 
         st.dataframe(
             pd.DataFrame(allocation_rows),
             hide_index=True,
             use_container_width=True,
+            height=420,
         )
 
         st.caption(
-            "Reason uses the LLM review when available, otherwise the quantitative "
-            "reason. Data gaps are shown explicitly when source data is incomplete."
+            "Reason comes from the LLM challenge review when available; otherwise it is the first quantitative reason. "
+            "Data confidence is the evidence-completeness score, not an investment-quality score."
         )
 
         for item in allocation:
-            fund_name = item.get("scheme_name") or item.get("fund") or "Unknown fund"
+            warnings = item.get("data_warnings") or []
             review = item.get("llm_review") or {}
-            score = item.get("score") or {}
-            warnings = item.get("data_warnings") or score.get("data_warnings") or []
-
-            with st.expander(f"Why {fund_name}?"):
-                st.write(f"**Reason:** {allocation_reason(item)}")
-
-                if review:
-                    key_reasons = review.get("key_reasons") or []
-                    contradictions = review.get("contradictions") or []
-                    risks = review.get("material_risks") or []
-                    gaps = review.get("data_gaps") or []
-
-                    if key_reasons:
-                        st.write("**LLM reasons**")
-                        for reason in key_reasons:
-                            st.write("•", reason)
-
-                    if contradictions:
-                        st.write("**Contradictions**")
-                        for contradiction in contradictions:
-                            st.write("•", contradiction)
-
-                    if risks:
-                        st.write("**Material risks**")
-                        for risk in risks:
-                            st.write("•", risk)
-
-                    if gaps:
-                        st.write("**LLM data gaps**")
-                        for gap in gaps:
-                            st.warning(str(gap))
-
-                if warnings:
-                    st.write("**Quantitative data gaps**")
-                    for warning in warnings:
-                        st.warning(str(warning))
-
-                confidence = (
-                    item.get("data_confidence")
-                    or score.get("data_confidence")
-                    or review.get("data_confidence")
-                )
-                if confidence is not None:
-                    st.caption(f"Data confidence: {confidence}")
-
-                if not review:
-                    st.caption(
-                        "LLM review is not present for this allocation. "
-                        "The reason above is from the quantitative engine."
-                    )
+            if warnings or review:
+                with st.expander(f"Why {item.get('scheme_name')}?", expanded=False):
+                    st.write("**Reason**", item.get("reason") or "No explanation returned.")
+                    if review:
+                        if review.get("key_reasons"):
+                            st.write("**LLM reasons**")
+                            for reason in review["key_reasons"]:
+                                st.write("•", reason)
+                        if review.get("contradictions"):
+                            st.write("**Contradictions**")
+                            for reason in review["contradictions"]:
+                                st.write("•", reason)
+                        if review.get("material_risks"):
+                            st.write("**Material risks**")
+                            for reason in review["material_risks"]:
+                                st.write("•", reason)
+                        if review.get("data_gaps"):
+                            st.write("**LLM data gaps**")
+                            for reason in review["data_gaps"]:
+                                st.warning(reason)
+                    if warnings:
+                        st.write("**Quantitative data gaps**")
+                        for warning in warnings:
+                            st.warning(warning)
     else:
         st.info(
             "No new allocation passed the current "
@@ -1677,56 +1621,52 @@ with tab_macro:
     }
 
     macro_sources = macro.get("macro_sources") or {}
-
-    macro_display_rows = []
+    source_keys = {
+        "USD/INR": "usd_inr",
+        "Brent crude": "brent_crude_usd",
+        "India VIX": "india_vix",
+        "India 10Y yield": "india_10y_yield_pct",
+        "Nifty 50": "nifty_50",
+        "Nifty Midcap": "nifty_midcap",
+        "Nifty Smallcap": "nifty_smallcap",
+        "Gold": "gold_usd",
+        "US 10Y yield": "us_10y_yield_pct",
+        "S&P 500": "sp500",
+        "Crude 1M change": "crude_change_1m_pct",
+        "USD/INR 1M change": "usd_inr_change_1m_pct",
+        "VIX 1M change": "india_vix_change_1m_pct",
+        "Inflation": "inflation_pct",
+        "Repo rate": "repo_rate_pct",
+    }
+    macro_rows_display = []
     for key, value in macro_rows.items():
-        source = macro_sources.get(key)
-        if key == "India 10Y yield":
-            source = source or macro_sources.get("india_10y_yield_pct")
-        elif key == "Inflation":
-            source = source or macro_sources.get("inflation_pct")
-        elif key == "Repo rate":
-            source = source or macro_sources.get("repo_rate_pct")
-
-        macro_display_rows.append(
-            {
-                "Indicator": key,
-                "Value": display_value(
-                    value,
-                    "%" if key in {
-                        "India 10Y yield",
-                        "US 10Y yield",
-                        "Inflation",
-                        "Repo rate",
-                        "Crude 1M change",
-                        "USD/INR 1M change",
-                        "VIX 1M change",
-                    } else "",
-                ),
-                "Source": source or "Unavailable",
-            }
-        )
+        source_key = source_keys[key]
+        source = macro_sources.get(source_key)
+        if source in (None, "", "Unavailable", "No source") and value is not None:
+            source = "Yahoo Finance" if source_key not in {"india_10y_yield_pct", "inflation_pct", "repo_rate_pct"} else "RBI DBIE"
+        macro_rows_display.append({
+            "Indicator": key,
+            "Value": value if value is not None else "Unavailable",
+            "Source": source or "Unavailable",
+        })
 
     st.dataframe(
-        pd.DataFrame(macro_display_rows),
+        pd.DataFrame(macro_rows_display),
         hide_index=True,
         use_container_width=True,
     )
 
-    fetched_at = macro.get("fetched_at")
-    if fetched_at:
-        st.caption(f"Macro data fetched: {fetched_at}")
+    if macro.get("fetched_at"):
+        st.caption(f"Macro snapshot fetched: {macro.get('fetched_at')}")
 
     missing_macro = [
-        name
-        for name, value in macro_rows.items()
-        if value is None or value == ""
+        label for label, value in macro_rows.items()
+        if value is None
     ]
     if missing_macro:
         st.warning(
-            "Some macro indicators are unavailable in this analysis: "
+            "Some macro indicators are unavailable from the configured sources: "
             + ", ".join(missing_macro)
-            + ". Regime logic treats unavailable inputs as unknown rather than inventing values."
         )
 
     st.subheader("Regime signals")
