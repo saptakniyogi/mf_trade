@@ -6,3 +6,4 @@ feedparser>=6.0,<7
 yfinance>=0.2,<1
 mftool>=3.4,<4
 watchdog>=6.0,<7
+kagglehub>=1.0,<2

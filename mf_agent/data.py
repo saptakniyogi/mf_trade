@@ -61,11 +61,26 @@ CATEGORY_RULES = [
 
 MFDATA_BASE_URL = os.getenv("MF_DATA_API_URL", "https://mfdata.in").rstrip("/")
 MFDATA_CACHE_TTL_HOURS = max(1.0, float(os.getenv("MF_DATA_CACHE_TTL_HOURS", "24")))
-MFDATA_FAMILY_ENRICHMENT_LIMIT = max(0, int(os.getenv("MF_DATA_FAMILY_ENRICHMENT_LIMIT", "10")))
-MFDATA_TIMEOUT_SECONDS = max(2, int(os.getenv("MF_DATA_TIMEOUT_SECONDS", "5")))
+MFDATA_FAMILY_ENRICHMENT_LIMIT = max(0, int(os.getenv("MF_DATA_FAMILY_ENRICHMENT_LIMIT", "20")))
+MFDATA_TIMEOUT_SECONDS = max(5, int(os.getenv("MF_DATA_TIMEOUT_SECONDS", "15")))
 MFDATA_BULK_CHUNK_SIZE = max(25, min(100, int(os.getenv("MF_DATA_BULK_CHUNK_SIZE", "50"))))
-MFDATA_INDIVIDUAL_FALLBACK_LIMIT = max(0, int(os.getenv("MF_DATA_INDIVIDUAL_FALLBACK_LIMIT", "3")))
+MFDATA_MAX_WORKERS = max(1, min(12, int(os.getenv("MF_DATA_MAX_WORKERS", "6"))))
+MFDATA_INDIVIDUAL_FALLBACK_LIMIT = max(0, int(os.getenv("MF_DATA_INDIVIDUAL_FALLBACK_LIMIT", "50")))
 MFTOOL_PERFORMANCE_CACHE_TTL_HOURS = max(1.0, float(os.getenv("MFTOOL_PERFORMANCE_CACHE_TTL_HOURS", "24")))
+
+# Kaggle is an optional secondary/tertiary NAV-history backup. It is deliberately
+# lazy-loaded so normal runs do not require Kaggle credentials or a large dataset
+# download unless a fund is still missing historical NAV metrics.
+KAGGLE_NAV_ENABLED = os.getenv("MF_KAGGLE_NAV_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
+KAGGLE_NAV_DATASET = os.getenv(
+    "MF_KAGGLE_NAV_DATASET",
+    "tharunreddy2911/mutual-fund-historic-nav-data",
+).strip()
+KAGGLE_NAV_CACHE_DIR = os.getenv("MF_KAGGLE_NAV_CACHE_DIR", "kaggle_nav_cache")
+KAGGLE_NAV_MAX_STALENESS_DAYS = max(1, int(os.getenv("MF_KAGGLE_NAV_MAX_STALENESS_DAYS", "45")))
+KAGGLE_NAV_CACHE_TTL_HOURS = max(1.0, float(os.getenv("MF_KAGGLE_NAV_CACHE_TTL_HOURS", "168")))
+KAGGLE_NAV_CHUNK_SIZE = max(10_000, int(os.getenv("MF_KAGGLE_NAV_CHUNK_SIZE", "100000")))
+KAGGLE_NAV_SOURCE_QUALITY = 0.82
 
 def classify_category(name: str) -> str:
     lower = name.lower()
@@ -191,6 +206,329 @@ def _calculate_nav_metrics(df: pd.DataFrame) -> dict:
         result["max_drawdown_pct"] = round(float(drawdowns.min()), 2)
 
     return result
+
+
+def _parse_kaggle_date(value):
+    text = str(value or "").strip()
+    if not text:
+        return pd.NaT
+    try:
+        # ISO dates are common in exported datasets; AMFI-style dates are
+        # commonly DD-MM-YYYY/DD/MM/YYYY. Handle both without ambiguity.
+        if len(text) >= 8 and text[0:4].isdigit() and text[4] in {"-", "/"}:
+            return pd.to_datetime(text, errors="coerce", dayfirst=False)
+        return pd.to_datetime(text, errors="coerce", dayfirst=True)
+    except Exception:
+        return pd.NaT
+
+
+def _kaggle_code_key(value) -> str:
+    text = str(value or "").strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    return text
+
+
+def _kaggle_name_key(value: str) -> str:
+    """Create a conservative scheme-name key while preserving plan/option identity."""
+    text = " ".join(str(value or "").lower().replace("&", "and").split())
+    for token in ("-", "/", "(", ")", ",", "."):
+        text = text.replace(token, " ")
+    return " ".join(text.split())
+
+
+def _kaggle_base_name_key(value: str) -> str:
+    """Create a fallback key for datasets that omit direct/regular plan labels."""
+    text = _kaggle_name_key(value)
+    tokens = {
+        "direct", "regular", "plan", "growth", "option", "dividend", "idcw",
+        "reinvestment", "reinvest", "bonus",
+    }
+    return " ".join(token for token in text.split() if token not in tokens)
+
+
+def _kaggle_cache_root(settings: Settings) -> Path:
+    root = Path(settings.market_cache_dir) / KAGGLE_NAV_CACHE_DIR
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _kaggle_history_cache_path(settings: Settings, record: FundRecord) -> Path:
+    identity = f"{record.scheme_code}|{record.scheme_name}"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return _kaggle_cache_root(settings) / f"{digest}.json"
+
+
+def _read_kaggle_history_cache(settings: Settings, record: FundRecord) -> pd.DataFrame | None:
+    path = _kaggle_history_cache_path(settings, record)
+    try:
+        if not path.exists():
+            return None
+        if time.time() - path.stat().st_mtime > KAGGLE_NAV_CACHE_TTL_HOURS * 3600:
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or not isinstance(payload.get("rows"), list):
+            return None
+        rows = []
+        for item in payload["rows"]:
+            if not isinstance(item, dict):
+                continue
+            date_value = pd.to_datetime(item.get("date"), errors="coerce")
+            nav_value = safe_float(item.get("nav"))
+            if pd.notna(date_value) and nav_value is not None and nav_value > 0:
+                rows.append((date_value, nav_value))
+        if not rows:
+            return None
+        return pd.DataFrame(rows, columns=["date", "nav"]).sort_values("date").reset_index(drop=True)
+    except Exception:
+        return None
+
+
+def _write_kaggle_history_cache(settings: Settings, record: FundRecord, df: pd.DataFrame) -> None:
+    try:
+        rows = [
+            {"date": row.date.strftime("%Y-%m-%d"), "nav": float(row.nav)}
+            for row in df.itertuples(index=False)
+        ]
+        path = _kaggle_history_cache_path(settings, record)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"rows": rows}, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    except Exception as exc:
+        logger.debug("Could not cache Kaggle NAV history for %s: %s", record.scheme_name, exc)
+
+
+def _kaggle_file_columns(path: Path) -> tuple[list[str], str] | None:
+    suffix = path.suffix.lower()
+    try:
+        if suffix in {".csv", ".tsv"}:
+            sep = "\t" if suffix == ".tsv" else ","
+            return list(pd.read_csv(path, sep=sep, nrows=0).columns), sep
+        if suffix == ".parquet":
+            return list(pd.read_parquet(path, engine="auto").columns), "parquet"
+        return None
+    except Exception as exc:
+        logger.warning("Could not inspect Kaggle NAV file %s: %s", path, exc)
+        return None
+
+
+def _find_kaggle_column(columns: list[str], candidates: tuple[str, ...]) -> str | None:
+    normalized = {_kaggle_name_key(column): column for column in columns}
+    for candidate in candidates:
+        if candidate in normalized:
+            return normalized[candidate]
+    for column in columns:
+        key = _kaggle_name_key(column)
+        if any(candidate in key for candidate in candidates):
+            return column
+    return None
+
+
+def _kaggle_dataset_files(dataset_path: str) -> list[Path]:
+    root = Path(dataset_path)
+    if not root.exists():
+        return []
+    return sorted(
+        path for path in root.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".csv", ".tsv", ".parquet"}
+    )
+
+
+def _download_kaggle_nav_dataset(settings: Settings) -> list[Path]:
+    if not KAGGLE_NAV_ENABLED:
+        return []
+    try:
+        import kagglehub
+    except ImportError:
+        logger.info("Kaggle NAV backup disabled because kagglehub is not installed.")
+        return []
+
+    output_dir = _kaggle_cache_root(settings) / "dataset"
+    try:
+        dataset_path = kagglehub.dataset_download(
+            KAGGLE_NAV_DATASET,
+            output_dir=str(output_dir),
+        )
+        files = _kaggle_dataset_files(dataset_path)
+        if not files:
+            logger.warning("Kaggle NAV dataset downloaded but no CSV/TSV/Parquet files were found: %s", dataset_path)
+            return []
+        logger.info("Kaggle NAV dataset available: %s (%d data files)", dataset_path, len(files))
+        return files
+    except Exception as exc:
+        logger.warning(
+            "Kaggle NAV backup unavailable for %s: %s. Set KAGGLE_API_TOKEN if Kaggle requests authentication.",
+            KAGGLE_NAV_DATASET,
+            exc,
+        )
+        return []
+
+
+def _load_kaggle_histories(settings: Settings, records: list[FundRecord]) -> dict[str, pd.DataFrame]:
+    """Load only requested fund histories from the Kaggle NAV dataset.
+
+    The dataset schema is discovered at runtime because Kaggle datasets can change
+    file names/column names. Exact scheme-code matches are preferred. Name matching
+    is conservative and only falls back to a base-name match when it is unique.
+    """
+    targets_by_code = {_kaggle_code_key(r.scheme_code): r for r in records if r.scheme_code}
+    targets_by_name = {_kaggle_name_key(r.scheme_name): r for r in records}
+    targets_by_base: dict[str, list[FundRecord]] = {}
+    for record in records:
+        targets_by_base.setdefault(_kaggle_base_name_key(record.scheme_name), []).append(record)
+
+    histories: dict[str, list[tuple[pd.Timestamp, float]]] = {}
+    files = _download_kaggle_nav_dataset(settings)
+    if not files:
+        return {}
+
+    for path in files:
+        info = _kaggle_file_columns(path)
+        if not info:
+            continue
+        columns, sep = info
+        code_col = _find_kaggle_column(columns, ("scheme code", "scheme_code", "amfi code", "amfi_code", "code"))
+        name_col = _find_kaggle_column(columns, ("scheme name", "scheme_name", "fund name", "fund_name", "name"))
+        date_col = _find_kaggle_column(columns, ("date", "nav date", "nav_date", "as of date"))
+        nav_col = _find_kaggle_column(columns, ("nav", "net asset value", "net_asset_value", "net asset value rs"))
+        if not date_col or not nav_col or not (code_col or name_col):
+            logger.warning("Skipping Kaggle NAV file with unsupported schema: %s columns=%s", path, columns)
+            continue
+
+        usecols = [column for column in (code_col, name_col, date_col, nav_col) if column]
+        try:
+            if sep == "parquet":
+                frame = pd.read_parquet(path, columns=usecols)
+                chunks = [frame]
+            else:
+                chunks = pd.read_csv(path, sep=sep, usecols=usecols, chunksize=KAGGLE_NAV_CHUNK_SIZE)
+
+            for chunk in chunks:
+                chunk = chunk.copy()
+                chunk[date_col] = chunk[date_col].map(_parse_kaggle_date)
+                chunk[nav_col] = pd.to_numeric(chunk[nav_col], errors="coerce")
+                chunk = chunk.dropna(subset=[date_col, nav_col])
+                chunk = chunk[chunk[nav_col] > 0]
+                if chunk.empty:
+                    continue
+
+                for row in chunk.itertuples(index=False, name=None):
+                    values = dict(zip(usecols, row))
+                    code = _kaggle_code_key(values.get(code_col)) if code_col else ""
+                    name = str(values.get(name_col) or "").strip() if name_col else ""
+                    matched: list[FundRecord] = []
+                    if code and code in targets_by_code:
+                        matched = [targets_by_code[code]]
+                    elif name:
+                        exact = targets_by_name.get(_kaggle_name_key(name))
+                        if exact:
+                            matched = [exact]
+                        else:
+                            base_matches = targets_by_base.get(_kaggle_base_name_key(name), [])
+                            if len(base_matches) == 1:
+                                matched = base_matches
+                    if not matched:
+                        continue
+                    date_value = pd.Timestamp(values[date_col])
+                    nav_value = float(values[nav_col])
+                    for record in matched:
+                        key = record.scheme_code or record.scheme_name
+                        histories.setdefault(key, []).append((date_value, nav_value))
+        except Exception as exc:
+            logger.warning("Could not read Kaggle NAV file %s: %s", path, exc)
+
+    result = {}
+    for record in records:
+        key = record.scheme_code or record.scheme_name
+        rows = histories.get(key, [])
+        if not rows:
+            continue
+        frame = pd.DataFrame(rows, columns=["date", "nav"])
+        frame = frame.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
+        result[key] = frame
+        _write_kaggle_history_cache(settings, record, frame)
+    return result
+
+
+def _enrich_from_kaggle_nav(settings: Settings, records: list[FundRecord]) -> None:
+    """Fill still-missing NAV/risk metrics from the Kaggle historical NAV dataset."""
+    candidates = [
+        record for record in records
+        if any(getattr(record, field) is None for field in (
+            "latest_nav", "cagr_1y_pct", "cagr_3y_pct", "cagr_5y_pct",
+            "volatility_pct", "max_drawdown_pct", "sharpe", "sortino",
+        ))
+    ]
+    if not candidates:
+        return
+
+    histories = {}
+    for record in candidates:
+        cached = _read_kaggle_history_cache(settings, record)
+        if cached is not None:
+            histories[record.scheme_code or record.scheme_name] = cached
+
+    missing = [record for record in candidates if (record.scheme_code or record.scheme_name) not in histories]
+    if missing:
+        loaded = _load_kaggle_histories(settings, missing)
+        histories.update(loaded)
+
+    enriched = 0
+    skipped_stale = 0
+    cutoff = pd.Timestamp.now(tz="UTC").tz_localize(None) - pd.Timedelta(days=KAGGLE_NAV_MAX_STALENESS_DAYS)
+    for record in candidates:
+        key = record.scheme_code or record.scheme_name
+        history = histories.get(key)
+        if history is None or history.empty:
+            continue
+        latest_date = pd.Timestamp(history.iloc[-1]["date"])
+        if latest_date < cutoff:
+            skipped_stale += 1
+            logger.info(
+                "Kaggle NAV history stale for %s: latest=%s max_staleness_days=%d",
+                record.scheme_name,
+                latest_date.strftime("%Y-%m-%d"),
+                KAGGLE_NAV_MAX_STALENESS_DAYS,
+            )
+            continue
+        metrics = _calculate_nav_metrics(history)
+        if not metrics:
+            continue
+        changed = False
+        risk_fields = {"volatility_pct", "max_drawdown_pct", "sharpe", "sortino"}
+        for field in (
+            "latest_nav", "cagr_1y_pct", "cagr_3y_pct", "cagr_5y_pct",
+            "volatility_pct", "max_drawdown_pct", "sharpe", "sortino",
+        ):
+            # Do not derive annualized risk statistics from a handful of NAV
+            # observations. CAGR/latest NAV can still be useful with shorter
+            # histories, while risk metrics require a meaningful sample.
+            if field in risk_fields and len(history) < 30:
+                continue
+            value = metrics.get(field)
+            if value is not None and getattr(record, field) is None:
+                setattr(record, field, value)
+                record.data_sources[field] = "Kaggle / mutual-fund-historic-nav-data"
+                changed = True
+        if record.nav_date is None and metrics.get("nav_date"):
+            record.nav_date = metrics["nav_date"]
+            record.data_sources["nav_date"] = "Kaggle / mutual-fund-historic-nav-data"
+            changed = True
+        if changed:
+            record.nav_history_observations = max(
+                record.nav_history_observations or 0,
+                metrics.get("nav_history_observations") or 0,
+            )
+            record.source_quality = max(record.source_quality, KAGGLE_NAV_SOURCE_QUALITY)
+            enriched += 1
+
+    logger.info(
+        "Kaggle NAV fallback enrichment: enriched=%d/%d stale=%d dataset=%s",
+        enriched,
+        len(candidates),
+        skipped_stale,
+        KAGGLE_NAV_DATASET,
+    )
 
 
 def _historical_metrics(mf: Mftool, code: str) -> dict:
@@ -414,19 +752,20 @@ def _enrich_from_mftool_performance(records: list[FundRecord], performance: dict
 
 def _make_session() -> requests.Session:
     session = requests.Session()
-    # mfdata is an optional enrichment provider. Do not let urllib3 perform
-    # hidden connection/read retries because they can turn one provider outage
-    # into minutes of dashboard latency. Circuit-break the provider instead.
+    # Keep retries bounded. A provider timeout must not block the analysis for
+    # minutes, but transient 5xx responses are worth one quick retry.
     retry = Retry(
-        total=0,
-        connect=0,
-        read=0,
+        total=1,
+        connect=1,
+        read=1,
         redirect=0,
-        status=0,
+        status=1,
+        backoff_factor=0.25,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "POST"}),
         raise_on_status=False,
     )
     session.mount("https://", HTTPAdapter(max_retries=retry))
-    session._mfdata_unavailable = False
     session.headers.update({
         "User-Agent": "MF Research Dashboard/2.3",
         "Accept": "application/json",
@@ -463,15 +802,7 @@ def _write_cache(path: Path, payload) -> None:
         logger.debug("Could not cache mfdata response: %s", exc)
 
 
-def _mark_mfdata_unavailable(session: requests.Session, reason: str) -> None:
-    if not getattr(session, "_mfdata_unavailable", False):
-        session._mfdata_unavailable = True
-        logger.warning("mfdata enrichment disabled for this run: %s", reason)
-
-
 def _mfdata_get(session: requests.Session, settings: Settings, path: str, params: dict | None = None):
-    if getattr(session, "_mfdata_unavailable", False):
-        return None
     url = f"{MFDATA_BASE_URL}{path}"
     cache = _cache_path(settings, url, params)
     cached = _read_cache(cache)
@@ -479,9 +810,6 @@ def _mfdata_get(session: requests.Session, settings: Settings, path: str, params
         return cached
     try:
         response = session.get(url, params=params, timeout=MFDATA_TIMEOUT_SECONDS)
-        if response.status_code >= 500:
-            _mark_mfdata_unavailable(session, f"HTTP {response.status_code} from {path}")
-            return None
         if response.status_code >= 400:
             logger.warning("mfdata GET %s returned HTTP %s", path, response.status_code)
             return None
@@ -489,7 +817,7 @@ def _mfdata_get(session: requests.Session, settings: Settings, path: str, params
         _write_cache(cache, payload)
         return payload
     except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
-        _mark_mfdata_unavailable(session, f"{type(exc).__name__} for {path}")
+        logger.warning("mfdata GET failed for %s: %s", path, exc)
         return None
     except (ValueError, requests.exceptions.RequestException) as exc:
         logger.warning("mfdata GET failed for %s: %s", path, exc)
@@ -497,8 +825,6 @@ def _mfdata_get(session: requests.Session, settings: Settings, path: str, params
 
 
 def _mfdata_post(session: requests.Session, settings: Settings, path: str, payload: dict):
-    if getattr(session, "_mfdata_unavailable", False):
-        return None
     url = f"{MFDATA_BASE_URL}{path}"
     cache = _cache_path(settings, url, payload)
     cached = _read_cache(cache)
@@ -506,9 +832,6 @@ def _mfdata_post(session: requests.Session, settings: Settings, path: str, paylo
         return cached
     try:
         response = session.post(url, json=payload, timeout=MFDATA_TIMEOUT_SECONDS)
-        if response.status_code >= 500:
-            _mark_mfdata_unavailable(session, f"HTTP {response.status_code} from {path}")
-            return None
         if response.status_code >= 400:
             logger.warning("mfdata POST %s returned HTTP %s", path, response.status_code)
             return None
@@ -516,7 +839,7 @@ def _mfdata_post(session: requests.Session, settings: Settings, path: str, paylo
         _write_cache(cache, result)
         return result
     except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
-        _mark_mfdata_unavailable(session, f"{type(exc).__name__} for {path}")
+        logger.warning("mfdata POST failed for %s: %s", path, exc)
         return None
     except (ValueError, requests.exceptions.RequestException) as exc:
         logger.warning("mfdata POST failed for %s: %s", path, exc)
@@ -556,14 +879,32 @@ def _extract_ratio_metrics(data: dict) -> dict:
     ratios = data.get("ratios") if isinstance(data, dict) else None
     if not isinstance(ratios, dict):
         return {}
+
+    # mfdata returns ratios in two shapes across its enrichment sources:
+    # nested groups (valuation/risk/return) and flat keys (pe/pb/sharpe/etc.).
     risk = ratios.get("risk") if isinstance(ratios.get("risk"), dict) else {}
     ret = ratios.get("return") if isinstance(ratios.get("return"), dict) else {}
     valuation = ratios.get("valuation") if isinstance(ratios.get("valuation"), dict) else {}
+
+    def first_number(*values):
+        for value in values:
+            parsed = _number(value)
+            if parsed is not None:
+                return parsed
+        return None
+
+    valuation_keys = ("pe", "pb", "ps", "dividend_yield")
+    valuation_out = {}
+    for key in valuation_keys:
+        value = first_number(valuation.get(key), ratios.get(key))
+        if value is not None:
+            valuation_out[key] = value
+
     return {
-        "sharpe": _number(ret.get("sharpe", ratios.get("sharpe"))),
-        "sortino": _number(risk.get("sortino", ratios.get("sortino"))),
-        "volatility_pct": _number(risk.get("std_deviation", ratios.get("std_deviation"))),
-        "valuation": {k: _number(v) for k, v in valuation.items() if _number(v) is not None},
+        "sharpe": first_number(ret.get("sharpe"), ratios.get("sharpe")),
+        "sortino": first_number(risk.get("sortino"), ratios.get("sortino")),
+        "volatility_pct": first_number(risk.get("std_deviation"), ratios.get("std_deviation")),
+        "valuation": valuation_out,
     }
 
 
@@ -599,148 +940,185 @@ def _extract_holdings(payload: dict) -> tuple[dict[str, float], dict[str, float]
     return holdings, sectors, market_caps
 
 
-def _enrich_from_mfdata(settings: Settings, records: list[FundRecord], holdings: dict[str, Holding]) -> None:
-    """Enrich a bounded, deterministic subset without making the whole run depend on mfdata.
+def _extract_risk_detail(data: dict) -> dict:
+    if not isinstance(data, dict):
+        return {}
+    drawdown = data.get("drawdown") if isinstance(data.get("drawdown"), dict) else {}
+    risk_return = data.get("risk_return") if isinstance(data.get("risk_return"), dict) else {}
+    return {
+        "max_drawdown_pct": _number(drawdown.get("max_drawdown_pct")),
+        "annualized_risk": _number(risk_return.get("annualized_risk")),
+    }
 
-    The API is deliberately treated as an enrichment layer, not the sole source of truth.
-    Cached responses are reused for 24 hours by default. If mfdata is unavailable, mftool and
-    local factsheets remain usable and the scorer marks the missing evidence explicitly.
+
+def _detail_from_payload(payload) -> dict | None:
+    data = _payload_data(payload)
+    return data if isinstance(data, dict) else None
+
+
+def _record_mfdata_detail(record: FundRecord, detail: dict) -> None:
+    """Merge one mfdata scheme response without replacing stronger existing metrics."""
+    record.source_quality = max(record.source_quality, 0.90)
+
+    nav = _number(detail.get("nav"))
+    if nav is not None:
+        record.latest_nav = nav
+        record.data_sources["latest_nav"] = "mfdata.in scheme details"
+    if detail.get("nav_date"):
+        record.nav_date = detail.get("nav_date")
+        record.data_sources["nav_date"] = "mfdata.in scheme details"
+    aum = _number(detail.get("aum_cr", detail.get("aum_inr_cr")))
+    if aum is not None:
+        record.aum_inr_cr = aum
+        record.data_sources["aum_inr_cr"] = "mfdata.in scheme details"
+    if detail.get("inception_date"):
+        record.inception_date = detail.get("inception_date")
+        record.data_sources["inception_date"] = "mfdata.in scheme details"
+    benchmark = detail.get("benchmark")
+    if benchmark and str(benchmark).strip() not in {"-", "NA", "N/A"}:
+        record.benchmark = str(benchmark).strip()
+        record.data_sources["benchmark"] = "mfdata.in scheme details"
+
+    returns = _extract_returns(detail)
+    for field, value in returns.items():
+        if getattr(record, field) is None:
+            setattr(record, field, value)
+            record.data_sources[field] = "mfdata.in scheme details"
+
+    ratio_metrics = _extract_ratio_metrics(detail)
+    for field in ("sharpe", "sortino", "volatility_pct"):
+        value = ratio_metrics.get(field)
+        if value is not None and getattr(record, field) is None:
+            setattr(record, field, value)
+            record.data_sources[field] = "mfdata.in scheme details"
+    if ratio_metrics.get("valuation"):
+        record.valuation.update(ratio_metrics["valuation"])
+        record.data_sources["valuation"] = "mfdata.in scheme details"
+
+    family_id = detail.get("family_id")
+    if family_id is not None:
+        record._mfdata_family_id = str(family_id)
+        record.data_sources["family_id"] = "mfdata.in scheme details"
+
+
+def _fetch_mfdata_detail(settings: Settings, record: FundRecord):
+    """Fetch one scheme independently so one slow scheme cannot block the rest."""
+    if not record.scheme_code:
+        return record.scheme_code, None
+    session = _make_session()
+    payload = _mfdata_get(session, settings, f"/api/v1/schemes/{record.scheme_code}")
+    return record.scheme_code, _detail_from_payload(payload)
+
+
+def _fetch_family_holdings(settings: Settings, family_id: str):
+    session = _make_session()
+    payload = _mfdata_get(session, settings, f"/api/v1/families/{family_id}/holdings")
+    return family_id, _extract_holdings(payload or {})
+
+
+def _enrich_from_mfdata(settings: Settings, records: list[FundRecord], holdings: dict[str, Holding]) -> None:
+    """Enrich selected funds from mfdata with bulk-first, per-scheme fallback.
+
+    Bulk enrichment is an optimization, not a dependency. If the bulk endpoint
+    times out, each selected scheme is fetched independently. Family holdings are
+    fetched once per unique family_id and provide holdings, sectors and market-cap
+    weights. Scheme-level responses provide AUM, returns, ratios and valuation.
     """
     if not records:
         return
 
     session = _make_session()
-    codes = [r.scheme_code for r in records if r.scheme_code]
+    codes = [str(r.scheme_code) for r in records if r.scheme_code]
     details_by_code: dict[str, dict] = {}
 
-    # The catalog endpoint is intentionally never called here. AMFI/mftool already
-    # provide the universe. mfdata is only an optional enrichment provider.
-    # Keep bulk requests below the documented maximum to reduce timeout risk.
+    # Bulk is fast when available and cached, but failure here must never disable
+    # the individual fallback path.
     for start in range(0, len(codes), MFDATA_BULK_CHUNK_SIZE):
         chunk = codes[start:start + MFDATA_BULK_CHUNK_SIZE]
         payload = _mfdata_post(
             session,
             settings,
             "/api/v1/schemes/bulk",
-            {"scheme_codes": [int(x) if str(x).isdigit() else str(x) for x in chunk]},
+            {"scheme_codes": [int(x) if x.isdigit() else x for x in chunk]},
         )
         data = _payload_data(payload)
         if isinstance(data, list):
             for item in data:
-                if isinstance(item, dict):
-                    code = str(item.get("scheme_code") or item.get("amfi_code") or "")
-                    if code:
-                        details_by_code[code] = item
-        if getattr(session, "_mfdata_unavailable", False):
-            break
+                if not isinstance(item, dict):
+                    continue
+                code = str(item.get("scheme_code") or item.get("amfi_code") or "")
+                if code:
+                    details_by_code[code] = item
 
-    # Individual fallback is deliberately tiny and only uses valid scheme codes.
-    # If the provider timed out, the circuit breaker prevents any further calls.
-    if not details_by_code and not getattr(session, "_mfdata_unavailable", False) and MFDATA_INDIVIDUAL_FALLBACK_LIMIT:
-        priority = []
-        held_lower = {name.lower() for name in holdings}
-        for record in records:
-            if record.scheme_code and record.scheme_name.lower() in held_lower:
-                priority.append(record)
-        priority.extend(r for r in records if r.scheme_code and r not in priority)
-        for record in priority[:MFDATA_INDIVIDUAL_FALLBACK_LIMIT]:
-            payload = _mfdata_get(session, settings, f"/api/v1/schemes/{record.scheme_code}")
-            data = _payload_data(payload)
-            if isinstance(data, dict):
-                details_by_code[record.scheme_code] = data
-            if getattr(session, "_mfdata_unavailable", False):
-                break
+    missing = [r for r in records if r.scheme_code and str(r.scheme_code) not in details_by_code]
+    if missing:
+        logger.info(
+            "mfdata individual fallback: %d/%d schemes missing after bulk; fetching independently with %d workers.",
+            len(missing), len(records), MFDATA_MAX_WORKERS,
+        )
+        fallback_limit = min(len(missing), MFDATA_INDIVIDUAL_FALLBACK_LIMIT)
+        if fallback_limit:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(MFDATA_MAX_WORKERS, fallback_limit)) as pool:
+                futures = [pool.submit(_fetch_mfdata_detail, settings, record) for record in missing[:fallback_limit]]
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        code, detail = future.result()
+                        if detail:
+                            details_by_code[str(code)] = detail
+                    except Exception as exc:
+                        logger.warning("mfdata individual scheme enrichment failed: %s", exc)
 
     for record in records:
-        detail = details_by_code.get(record.scheme_code)
-        if not detail:
-            continue
+        detail = details_by_code.get(str(record.scheme_code))
+        if detail:
+            _record_mfdata_detail(record, detail)
 
-        record.source_quality = max(record.source_quality, 0.90)
-        record_data = detail
-        record.latest_nav = _number(record_data.get("nav")) or record.latest_nav
-        record.nav_date = record_data.get("nav_date") or record.nav_date
-        record.aum_inr_cr = _number(record_data.get("aum_cr", record_data.get("aum_inr_cr"))) or record.aum_inr_cr
-        record.inception_date = record_data.get("inception_date") or record.inception_date
-        record.benchmark = record_data.get("benchmark") or record.benchmark
-        returns = _extract_returns(record_data)
-        if record.cagr_1y_pct is None:
-            record.cagr_1y_pct = returns.get("cagr_1y_pct")
-        if record.cagr_3y_pct is None:
-            record.cagr_3y_pct = returns.get("cagr_3y_pct")
-        if record.cagr_5y_pct is None:
-            record.cagr_5y_pct = returns.get("cagr_5y_pct")
+    # Fetch portfolio data once per unique family. Family-level storage means
+    # direct/regular variants share the same underlying holdings.
+    family_to_records: dict[str, list[FundRecord]] = {}
+    for record in records:
+        family_id = getattr(record, "_mfdata_family_id", None)
+        if family_id:
+            family_to_records.setdefault(str(family_id), []).append(record)
 
-        ratio_metrics = _extract_ratio_metrics(record_data)
-        for field in ("sharpe", "sortino", "volatility_pct"):
-            value = ratio_metrics.get(field)
-            if value is not None:
-                setattr(record, field, value)
-        if ratio_metrics.get("valuation"):
-            record.valuation.update(ratio_metrics["valuation"])
-
-        record._mfdata_family_id = detail.get("family_id")
-
-    # Family-level data is expensive and rate-limited, so enrich held funds first and
-    # then the strongest preliminary candidates. Holdings contain sectors, so a separate
-    # sectors request is normally unnecessary.
     held_lower = {name.lower() for name in holdings}
-    candidates = sorted(
-        records,
-        key=lambda r: (
-            0 if r.scheme_name.lower() in held_lower else 1,
-            -(r.cagr_3y_pct if r.cagr_3y_pct is not None else r.cagr_1y_pct if r.cagr_1y_pct is not None else -999),
-            r.scheme_name.lower(),
+    ordered_families = sorted(
+        family_to_records,
+        key=lambda fid: min(
+            0 if r.scheme_name.lower() in held_lower else 1 for r in family_to_records[fid]
         ),
     )
-    family_candidates = [r for r in candidates if getattr(r, "_mfdata_family_id", None)]
-    family_candidates = family_candidates[:MFDATA_FAMILY_ENRICHMENT_LIMIT]
+    ordered_families = ordered_families[:MFDATA_FAMILY_ENRICHMENT_LIMIT]
 
-    for record in family_candidates:
-        family_id = getattr(record, "_mfdata_family_id", None)
-        if not family_id:
-            continue
+    if ordered_families:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(MFDATA_MAX_WORKERS, len(ordered_families))) as pool:
+            futures = [pool.submit(_fetch_family_holdings, settings, family_id) for family_id in ordered_families]
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    family_id, (fund_holdings, sectors, market_caps) = future.result()
+                except Exception as exc:
+                    logger.warning("mfdata family holdings enrichment failed: %s", exc)
+                    continue
+                for record in family_to_records.get(str(family_id), []):
+                    if fund_holdings:
+                        record.holdings.update(fund_holdings)
+                        record.data_sources["holdings"] = "mfdata.in family holdings"
+                    if sectors:
+                        record.sector_weights.update(sectors)
+                        record.data_sources["sector_weights"] = "mfdata.in family holdings"
+                    if market_caps:
+                        record.market_cap_weights.update(market_caps)
+                        record.data_sources["market_cap_weights"] = "mfdata.in family holdings"
+                    if fund_holdings or sectors or market_caps:
+                        record.source_quality = 1.0
 
-        holdings_payload = _mfdata_get(session, settings, f"/api/v1/families/{family_id}/holdings")
-        fund_holdings, sectors, market_caps = _extract_holdings(holdings_payload or {})
-        if fund_holdings:
-            record.holdings.update(fund_holdings)
-        if sectors:
-            record.sector_weights.update(sectors)
-        if market_caps:
-            record.market_cap_weights.update(market_caps)
-
-        ratios_payload = _mfdata_get(session, settings, f"/api/v1/families/{family_id}/ratios")
-        ratio_data = _payload_data(ratios_payload)
-        if isinstance(ratio_data, dict):
-            ratio_metrics = _extract_ratio_metrics(ratio_data)
-            for field in ("sharpe", "sortino", "volatility_pct"):
-                value = ratio_metrics.get(field)
-                if value is not None:
-                    setattr(record, field, value)
-            if ratio_metrics.get("valuation"):
-                record.valuation.update(ratio_metrics["valuation"])
-
-        risk_payload = _mfdata_get(session, settings, f"/api/v1/families/{family_id}/risk-detail")
-        risk_data = _payload_data(risk_payload)
-        if isinstance(risk_data, dict):
-            drawdown = risk_data.get("drawdown") if isinstance(risk_data.get("drawdown"), dict) else {}
-            risk_return = risk_data.get("risk_return") if isinstance(risk_data.get("risk_return"), dict) else {}
-            if _number(drawdown.get("max_drawdown_pct")) is not None:
-                record.max_drawdown_pct = _number(drawdown.get("max_drawdown_pct"))
-            if record.volatility_pct is None and _number(risk_return.get("annualized_risk")) is not None:
-                record.volatility_pct = _number(risk_return.get("annualized_risk"))
-
-        if record.holdings or record.sector_weights or record.valuation or record.sharpe is not None:
-            record.source_quality = 1.0
-
-    if getattr(session, "_mfdata_unavailable", False):
-        logger.warning("mfdata enrichment skipped after provider failure; using fallback data for this run.")
-    elif details_by_code:
-        logger.info("mfdata enrichment completed for %d/%d schemes.", len(details_by_code), len(codes))
-    else:
-        logger.info("mfdata returned no enrichment data; using fallback sources.")
-
+    enriched_count = sum(1 for record in records if str(record.scheme_code) in details_by_code)
+    portfolio_count = sum(1 for record in records if record.holdings)
+    valuation_count = sum(1 for record in records if record.valuation)
+    logger.info(
+        "mfdata enrichment completed: scheme_details=%d/%d holdings=%d/%d valuation=%d/%d",
+        enriched_count, len(records), portfolio_count, len(records), valuation_count, len(records),
+    )
 
 def _fund_record(mf: Mftool, item: dict, holdings: dict[str, Holding]) -> FundRecord:
     name = item["scheme_name"]
@@ -891,6 +1269,11 @@ def build_fund_universe(settings: Settings, holdings: dict[str, Holding]) -> lis
         _enrich_from_mftool_performance(records, performance)
     except Exception as exc:
         logger.warning("mftool performance enrichment failed: %s", exc)
+
+    try:
+        _enrich_from_kaggle_nav(settings, records)
+    except Exception as exc:
+        logger.warning("Kaggle NAV fallback enrichment failed; continuing with existing providers: %s", exc)
 
     try:
         _enrich_from_mfdata(settings, records, holdings)
