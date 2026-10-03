@@ -1491,8 +1491,11 @@ def _enrich_from_mfdata(settings: Settings, records: list[FundRecord], holdings:
     codes = [str(r.scheme_code) for r in records if r.scheme_code]
     details_by_code: dict[str, dict] = {}
 
-    # Bulk is fast when available and cached, but failure here must never disable
-    # the individual fallback path.
+    # Bulk is the only safe discovery path for this optional provider. If the
+    # bulk endpoint times out, do not fan out into many 15-second individual
+    # requests. That turns one provider outage into a multi-minute analysis
+    # stall and still rarely yields complete portfolio enrichment.
+    bulk_failed = False
     for start in range(0, len(codes), MFDATA_BULK_CHUNK_SIZE):
         chunk = codes[start:start + MFDATA_BULK_CHUNK_SIZE]
         payload = _mfdata_post(
@@ -1501,6 +1504,9 @@ def _enrich_from_mfdata(settings: Settings, records: list[FundRecord], holdings:
             "/api/v1/schemes/bulk",
             {"scheme_codes": [int(x) if x.isdigit() else x for x in chunk]},
         )
+        if payload is None:
+            bulk_failed = True
+            break
         data = _payload_data(payload)
         if isinstance(data, list):
             for item in data:
@@ -1510,23 +1516,30 @@ def _enrich_from_mfdata(settings: Settings, records: list[FundRecord], holdings:
                 if code:
                     details_by_code[code] = item
 
-    missing = [r for r in records if r.scheme_code and str(r.scheme_code) not in details_by_code]
-    if missing:
-        logger.info(
-            "mfdata individual fallback: %d/%d schemes missing after bulk; fetching independently with %d workers.",
-            len(missing), len(records), MFDATA_MAX_WORKERS,
+    if bulk_failed:
+        logger.warning(
+            "mfdata bulk enrichment unavailable; skipping individual scheme fallback "
+            "for this run to avoid blocking analysis."
         )
-        fallback_limit = min(len(missing), MFDATA_INDIVIDUAL_FALLBACK_LIMIT)
-        if fallback_limit:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(MFDATA_MAX_WORKERS, fallback_limit)) as pool:
-                futures = [pool.submit(_fetch_mfdata_detail, settings, record) for record in missing[:fallback_limit]]
-                for future in concurrent.futures.as_completed(futures):
-                    try:
-                        code, detail = future.result()
-                        if detail:
-                            details_by_code[str(code)] = detail
-                    except Exception as exc:
-                        logger.warning("mfdata individual scheme enrichment failed: %s", exc)
+    else:
+        missing = [r for r in records if r.scheme_code and str(r.scheme_code) not in details_by_code]
+        if missing:
+            logger.info(
+                "mfdata individual fallback: %d/%d schemes missing after successful bulk; "
+                "fetching up to %d independently with %d workers.",
+                len(missing), len(records), MFDATA_INDIVIDUAL_FALLBACK_LIMIT, MFDATA_MAX_WORKERS,
+            )
+            fallback_limit = min(len(missing), MFDATA_INDIVIDUAL_FALLBACK_LIMIT)
+            if fallback_limit:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(MFDATA_MAX_WORKERS, fallback_limit)) as pool:
+                    futures = [pool.submit(_fetch_mfdata_detail, settings, record) for record in missing[:fallback_limit]]
+                    for future in concurrent.futures.as_completed(futures):
+                        try:
+                            code, detail = future.result()
+                            if detail:
+                                details_by_code[str(code)] = detail
+                        except Exception as exc:
+                            logger.warning("mfdata individual scheme enrichment failed: %s", exc)
 
     for record in records:
         detail = details_by_code.get(str(record.scheme_code))
@@ -1725,8 +1738,10 @@ def build_fund_universe(settings: Settings, holdings: dict[str, Holding]) -> lis
     # snapshot plus full per-scheme history; mftool/AMFI remains the direct
     # fallback, followed by Creget/Kaggle archival sources when needed.
     try:
+        logger.info("TigZig/AMFI primary enrichment starting for %d funds.", len(records))
         _enrich_from_tigzig_snapshot(settings, records)
         _enrich_from_tigzig_nav(settings, records)
+        logger.info("TigZig/AMFI primary enrichment completed.")
     except Exception as exc:
         logger.warning("TigZig primary enrichment failed; continuing with AMFI/mftool fallbacks: %s", exc)
 
@@ -1745,8 +1760,11 @@ def build_fund_universe(settings: Settings, holdings: dict[str, Holding]) -> lis
         logger.warning("Kaggle fallback enrichment failed: %s", exc)
 
     try:
+        logger.info("mfdata optional enrichment starting for %d funds.", len(records))
         _enrich_from_mfdata(settings, records, holdings)
     except Exception as exc:
         logger.warning("mfdata enrichment failed; continuing with mftool/AMFI data: %s", exc)
+    finally:
+        logger.info("mfdata optional enrichment finished.")
 
     return records

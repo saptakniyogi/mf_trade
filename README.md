@@ -85,3 +85,7 @@ Relevant settings:
 - `MF_KAGGLE_NAV_DATASET=tharunreddy2911/mutual-fund-historic-nav-data`
 
 TigZig is an AMFI-derived provider rather than the AMFI website itself. The application therefore keeps mftool/AMFI as a fallback and does not treat third-party NAV data as an exclusive dependency.
+
+## Provider fail-fast behavior
+
+Optional `mfdata.in` enrichment is fail-fast at the bulk-provider boundary. If the bulk endpoint times out or is unavailable, the application skips the individual scheme fan-out for that run so an external provider outage cannot stall the analysis for several minutes. Higher-priority AMFI-derived NAV data remains available.
