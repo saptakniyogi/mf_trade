@@ -89,3 +89,12 @@ TigZig is an AMFI-derived provider rather than the AMFI website itself. The appl
 ## Provider fail-fast behavior
 
 Optional `mfdata.in` enrichment is fail-fast at the bulk-provider boundary. If the bulk endpoint times out or is unavailable, the application skips the individual scheme fan-out for that run so an external provider outage cannot stall the analysis for several minutes. Higher-priority AMFI-derived NAV data remains available.
+
+
+## Analysis fail-fast safeguards
+
+The normal analysis path does not scan the large legacy Kaggle NAV archive. The Kaggle provider is now an explicit opt-in through `MF_ENABLE_LEGACY_KAGGLE_FALLBACK=true`.
+
+The optional `mfdata.in` enrichment provider is also bounded so provider outages cannot hold the analysis indefinitely: request timeouts are capped at 5 seconds, individual fallback requests are capped at 10 schemes, and family-level enrichment is capped at 5 families per run.
+
+A healthy startup should log `Initializing data providers`, followed by `TigZig/AMFI primary enrichment starting` and `TigZig/AMFI primary enrichment completed`.

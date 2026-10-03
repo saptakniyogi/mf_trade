@@ -61,11 +61,11 @@ CATEGORY_RULES = [
 
 MFDATA_BASE_URL = os.getenv("MF_DATA_API_URL", "https://mfdata.in").rstrip("/")
 MFDATA_CACHE_TTL_HOURS = max(1.0, float(os.getenv("MF_DATA_CACHE_TTL_HOURS", "24")))
-MFDATA_FAMILY_ENRICHMENT_LIMIT = max(0, int(os.getenv("MF_DATA_FAMILY_ENRICHMENT_LIMIT", "20")))
-MFDATA_TIMEOUT_SECONDS = max(5, int(os.getenv("MF_DATA_TIMEOUT_SECONDS", "15")))
+MFDATA_FAMILY_ENRICHMENT_LIMIT = max(0, min(5, int(os.getenv("MF_DATA_FAMILY_ENRICHMENT_LIMIT", "5"))))
+MFDATA_TIMEOUT_SECONDS = max(3, min(5, int(os.getenv("MF_DATA_TIMEOUT_SECONDS", "5"))))
 MFDATA_BULK_CHUNK_SIZE = max(25, min(100, int(os.getenv("MF_DATA_BULK_CHUNK_SIZE", "50"))))
 MFDATA_MAX_WORKERS = max(1, min(12, int(os.getenv("MF_DATA_MAX_WORKERS", "6"))))
-MFDATA_INDIVIDUAL_FALLBACK_LIMIT = max(0, int(os.getenv("MF_DATA_INDIVIDUAL_FALLBACK_LIMIT", "50")))
+MFDATA_INDIVIDUAL_FALLBACK_LIMIT = max(0, min(10, int(os.getenv("MF_DATA_INDIVIDUAL_FALLBACK_LIMIT", "10"))))
 MFTOOL_PERFORMANCE_CACHE_TTL_HOURS = max(1.0, float(os.getenv("MFTOOL_PERFORMANCE_CACHE_TTL_HOURS", "24")))
 
 # TigZig publishes an AMFI-derived, normalized scheme snapshot and historical
@@ -95,7 +95,7 @@ CREGET_NAV_SOURCE_QUALITY = 0.97
 # Kaggle is an optional secondary/tertiary NAV-history backup. It is deliberately
 # lazy-loaded so normal runs do not require Kaggle credentials or a large dataset
 # download unless a fund is still missing historical NAV metrics.
-KAGGLE_NAV_ENABLED = os.getenv("MF_KAGGLE_NAV_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
+KAGGLE_NAV_ENABLED = os.getenv("MF_ENABLE_LEGACY_KAGGLE_FALLBACK", "false").strip().lower() not in {"0", "false", "no"}
 KAGGLE_NAV_DATASET = os.getenv(
     "MF_KAGGLE_NAV_DATASET",
     "tharunreddy2911/mutual-fund-historic-nav-data",
@@ -264,6 +264,7 @@ def _download_tigzig_latest(settings: Settings) -> Path | None:
     root = _tigzig_cache_root(settings)
     target = root / "latest.csv"
     if target.exists() and not _tigzig_should_refresh(settings):
+        logger.info("TigZig NAV snapshot cache hit: %s", target)
         return target
     url = f"{TIGZIG_NAV_BASE_URL}/download?format=latest"
     try:
@@ -1697,7 +1698,10 @@ def load_optional_factsheet_data(settings: Settings, scheme_name: str) -> dict:
 
 
 def build_fund_universe(settings: Settings, holdings: dict[str, Holding]) -> list[FundRecord]:
-    logger.info("Initializing mftool/AMFI data provider: version=%s", _MFTOOL_VERSION)
+    logger.info(
+        "Initializing data providers: mftool=%s TigZig_enabled=%s TigZig_base=%s Kaggle_legacy=%s",
+        _MFTOOL_VERSION, TIGZIG_NAV_ENABLED, TIGZIG_NAV_BASE_URL, KAGGLE_NAV_ENABLED,
+    )
     mf = Mftool()
     raw = fetch_universe(settings, mf)
     for name in holdings:
@@ -1751,13 +1755,19 @@ def build_fund_universe(settings: Settings, holdings: dict[str, Holding]) -> lis
     except Exception as exc:
         logger.warning("mftool performance enrichment failed: %s", exc)
 
-    # Retain the existing Kaggle layer as a tertiary fallback for environments
-    # where the AMFI-derived primary providers are temporarily unavailable.
-    try:
-        _enrich_from_kaggle_snapshot(settings, records)
-        _enrich_from_kaggle_nav(settings, records)
-    except Exception as exc:
-        logger.warning("Kaggle fallback enrichment failed: %s", exc)
+    # Kaggle is intentionally outside the normal analysis path. The previous
+    # implementation could spend minutes scanning the large historical parquet
+    # even when the primary AMFI-derived provider was already available. Keep
+    # the legacy fallback as an explicit opt-in only.
+    if KAGGLE_NAV_ENABLED:
+        logger.info("Legacy Kaggle fallback explicitly enabled; starting optional enrichment.")
+        try:
+            _enrich_from_kaggle_snapshot(settings, records)
+            _enrich_from_kaggle_nav(settings, records)
+        except Exception as exc:
+            logger.warning("Kaggle fallback enrichment failed: %s", exc)
+    else:
+        logger.info("Legacy Kaggle fallback disabled; skipping Kaggle dataset scan.")
 
     try:
         logger.info("mfdata optional enrichment starting for %d funds.", len(records))
