@@ -68,6 +68,30 @@ MFDATA_MAX_WORKERS = max(1, min(12, int(os.getenv("MF_DATA_MAX_WORKERS", "6"))))
 MFDATA_INDIVIDUAL_FALLBACK_LIMIT = max(0, int(os.getenv("MF_DATA_INDIVIDUAL_FALLBACK_LIMIT", "50")))
 MFTOOL_PERFORMANCE_CACHE_TTL_HOURS = max(1.0, float(os.getenv("MFTOOL_PERFORMANCE_CACHE_TTL_HOURS", "24")))
 
+# TigZig publishes an AMFI-derived, normalized scheme snapshot and historical
+# NAV API. It is the primary NAV provider because it is refreshed from AMFI and
+# exposes both current scheme metadata and full scheme histories without API keys.
+TIGZIG_NAV_ENABLED = os.getenv("MF_TIGZIG_NAV_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
+TIGZIG_NAV_BASE_URL = os.getenv("MF_TIGZIG_NAV_BASE_URL", "https://api.tigzig.com/mf/v1").rstrip("/")
+TIGZIG_NAV_CACHE_DIR = os.getenv("MF_TIGZIG_NAV_CACHE_DIR", "tigzig_nav_cache")
+TIGZIG_NAV_CACHE_TTL_HOURS = max(1.0, float(os.getenv("MF_TIGZIG_NAV_CACHE_TTL_HOURS", "24")))
+TIGZIG_NAV_SOURCE_QUALITY = 0.98
+TIGZIG_NAV_MAX_WORKERS = max(1, min(8, int(os.getenv("MF_TIGZIG_NAV_MAX_WORKERS", "4"))))
+TIGZIG_NAV_BULK_SIZE = max(1, min(50, int(os.getenv("MF_TIGZIG_NAV_BULK_SIZE", "50"))))
+
+# Creget is a second AMFI-derived archive. It is used for the latest snapshot
+# if TigZig is unavailable, before falling back to mftool/AMFI.
+CREGET_NAV_ENABLED = os.getenv("MF_CREGET_NAV_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
+CREGET_NAV_LATEST_URL = os.getenv(
+    "MF_CREGET_NAV_LATEST_URL",
+    "https://raw.githubusercontent.com/shahroz-a/mutual-fund-historical-data/mutual-fund-historical-data/data/latest.csv",
+).strip()
+CREGET_NAV_CACHE_DIR = os.getenv("MF_CREGET_NAV_CACHE_DIR", "creget_nav_cache")
+CREGET_NAV_SOURCE_QUALITY = 0.97
+
+# Kaggle remains an optional tertiary NAV-history backup.
+# It is deliberately lazy-loaded so normal runs do not require Kaggle credentials
+# or a large dataset download unless the stronger AMFI-derived sources are unavailable.
 # Kaggle is an optional secondary/tertiary NAV-history backup. It is deliberately
 # lazy-loaded so normal runs do not require Kaggle credentials or a large dataset
 # download unless a fund is still missing historical NAV metrics.
@@ -207,6 +231,236 @@ def _calculate_nav_metrics(df: pd.DataFrame) -> dict:
         result["max_drawdown_pct"] = round(float(drawdowns.min()), 2)
 
     return result
+
+
+def _tigzig_cache_root(settings: Settings) -> Path:
+    root = Path(settings.market_cache_dir) / TIGZIG_NAV_CACHE_DIR
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _tigzig_refresh_marker(settings: Settings) -> Path:
+    return _tigzig_cache_root(settings) / "refresh_state.json"
+
+
+def _read_tigzig_refresh_state(settings: Settings) -> dict:
+    path = _tigzig_refresh_marker(settings)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _tigzig_should_refresh(settings: Settings) -> bool:
+    state = _read_tigzig_refresh_state(settings)
+    return str(state.get("refresh_date") or "") != dt.date.today().isoformat()
+
+
+def _download_tigzig_latest(settings: Settings) -> Path | None:
+    """Refresh the AMFI-derived TigZig scheme snapshot at most once per day."""
+    if not TIGZIG_NAV_ENABLED:
+        return None
+    root = _tigzig_cache_root(settings)
+    target = root / "latest.csv"
+    if target.exists() and not _tigzig_should_refresh(settings):
+        return target
+    url = f"{TIGZIG_NAV_BASE_URL}/download?format=latest"
+    try:
+        response = requests.get(url, timeout=max(10, MFDATA_TIMEOUT_SECONDS))
+        response.raise_for_status()
+        tmp = target.with_suffix(".tmp")
+        tmp.write_bytes(response.content)
+        tmp.replace(target)
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        state = {"refreshed_at": now, "refresh_date": now[:10], "url": url}
+        marker = _tigzig_refresh_marker(settings)
+        marker.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        logger.info("TigZig NAV snapshot refreshed: %s (%d bytes)", target, len(response.content))
+        return target
+    except Exception as exc:
+        if target.exists():
+            logger.warning("TigZig NAV snapshot refresh failed; using last successful snapshot: %s", exc)
+            return target
+        logger.warning("TigZig NAV snapshot unavailable: %s", exc)
+        return None
+
+
+def _tigzig_cache_path(settings: Settings, record: FundRecord) -> Path:
+    identity = f"{record.scheme_code}|{record.scheme_name}"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return _tigzig_cache_root(settings) / f"{digest}.json"
+
+
+def _read_tigzig_history_cache(settings: Settings, record: FundRecord) -> pd.DataFrame | None:
+    path = _tigzig_cache_path(settings, record)
+    try:
+        if not path.exists() or time.time() - path.stat().st_mtime > TIGZIG_NAV_CACHE_TTL_HOURS * 3600:
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        rows = payload.get("data", []) if isinstance(payload, dict) else []
+        if not isinstance(rows, list):
+            return None
+        return _parse_nav_history_rows(rows)
+    except Exception:
+        return None
+
+
+def _write_tigzig_history_cache(settings: Settings, record: FundRecord, df: pd.DataFrame) -> None:
+    try:
+        rows = [{"date": row.date.strftime("%Y-%m-%d"), "nav": float(row.nav)} for row in df.itertuples(index=False)]
+        path = _tigzig_cache_path(settings, record)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"data": rows}, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    except Exception as exc:
+        logger.debug("Could not cache TigZig NAV history for %s: %s", record.scheme_name, exc)
+
+
+def _load_tigzig_snapshot(settings: Settings, records: list[FundRecord]) -> dict[str, dict]:
+    path = _download_tigzig_latest(settings)
+    if path is None:
+        return {}
+    try:
+        frame = pd.read_csv(path, low_memory=False)
+    except Exception as exc:
+        logger.warning("Could not read TigZig NAV snapshot %s: %s", path, exc)
+        return {}
+
+    columns = list(frame.columns)
+    code_col = _find_kaggle_column(columns, ("scheme_code", "scheme code", "amfi code", "amfi_code"))
+    name_col = _find_kaggle_column(columns, ("scheme_name", "scheme name"))
+    nav_col = _find_kaggle_column(columns, ("nav", "latest nav", "latest_nav"))
+    nav_date_col = _find_kaggle_column(columns, ("nav_date", "nav date", "latest nav date", "latest_nav_date"))
+    amc_col = _find_kaggle_column(columns, ("amc",))
+    category_col = _find_kaggle_column(columns, ("category_sub", "category", "scheme category", "scheme_category"))
+    aum_col = _find_kaggle_column(columns, ("aaum_cr_quarterly_avg", "average aum", "average_aum", "aaum"))
+    plan_col = _find_kaggle_column(columns, ("plan", "plan_type"))
+    inception_col = _find_kaggle_column(columns, ("first_nav_date", "first nav date", "launch date", "inception date"))
+    if not code_col and not name_col:
+        logger.warning("TigZig NAV snapshot has no scheme identifier columns: %s", columns)
+        return {}
+
+    by_code = {_kaggle_code_key(r.scheme_code): r for r in records if r.scheme_code}
+    by_name = {_kaggle_name_key(r.scheme_name): r for r in records}
+    result: dict[str, dict] = {}
+    matched = 0
+    for row in frame.to_dict(orient="records"):
+        code = _kaggle_code_key(row.get(code_col)) if code_col else ""
+        name = str(row.get(name_col) or "").strip() if name_col else ""
+        record = by_code.get(code) if code else None
+        if record is None and name:
+            record = by_name.get(_kaggle_name_key(name))
+        if record is None:
+            continue
+        result[record.scheme_code or record.scheme_name] = {
+            "scheme_name": name,
+            "latest_nav": safe_float(row.get(nav_col)) if nav_col else None,
+            "nav_date": str(row.get(nav_date_col) or "").strip() if nav_date_col else "",
+            "amc": str(row.get(amc_col) or "").strip() if amc_col else "",
+            "category": str(row.get(category_col) or "").strip() if category_col else "",
+            "aum_inr_cr": safe_float(row.get(aum_col)) if aum_col else None,
+            "plan_type": str(row.get(plan_col) or "").strip() if plan_col else "",
+            "inception_date": str(row.get(inception_col) or "").strip() if inception_col else "",
+        }
+        matched += 1
+    logger.info("TigZig NAV snapshot matched %d/%d selected funds.", matched, len(records))
+    return result
+
+
+def _enrich_from_tigzig_snapshot(settings: Settings, records: list[FundRecord]) -> None:
+    snapshot = _load_tigzig_snapshot(settings, records)
+    for record in records:
+        values = snapshot.get(record.scheme_code or record.scheme_name)
+        if not values:
+            continue
+        for field in ("latest_nav", "nav_date", "aum_inr_cr", "inception_date"):
+            value = values.get(field)
+            if value is not None and value != "":
+                setattr(record, field, value)
+                record.data_sources[field] = "TigZig / AMFI NAV snapshot"
+        for field in ("amc", "category"):
+            value = values.get(field)
+            if value:
+                setattr(record, field, value)
+                record.data_sources[field] = "TigZig / AMFI NAV snapshot"
+        if values.get("plan_type"):
+            plan = values["plan_type"].lower()
+            if "direct" in plan:
+                record.plan_type = "Direct Growth" if "growth" in plan else "Direct"
+            elif "regular" in plan:
+                record.plan_type = "Regular Growth" if "growth" in plan else "Regular"
+        record.source_quality = max(record.source_quality, TIGZIG_NAV_SOURCE_QUALITY)
+
+
+def _load_tigzig_histories(settings: Settings, records: list[FundRecord]) -> dict[str, pd.DataFrame]:
+    candidates = [r for r in records if r.scheme_code]
+    histories: dict[str, pd.DataFrame] = {}
+    missing: list[FundRecord] = []
+    for record in candidates:
+        cached = _read_tigzig_history_cache(settings, record)
+        if cached is not None and not cached.empty:
+            histories[record.scheme_code] = cached
+        else:
+            missing.append(record)
+    if not missing:
+        return histories
+
+    for start in range(0, len(missing), TIGZIG_NAV_BULK_SIZE):
+        batch = missing[start:start + TIGZIG_NAV_BULK_SIZE]
+        schemes = ",".join(_kaggle_code_key(r.scheme_code) for r in batch if r.scheme_code)
+        url = f"{TIGZIG_NAV_BASE_URL}/nav"
+        try:
+            response = requests.get(url, params={"schemes": schemes}, timeout=max(15, MFDATA_TIMEOUT_SECONDS))
+            response.raise_for_status()
+            payload = response.json()
+            scheme_payload = payload.get("schemes", {}) if isinstance(payload, dict) else {}
+            if not isinstance(scheme_payload, dict):
+                continue
+            for record in batch:
+                item = scheme_payload.get(str(record.scheme_code))
+                if not isinstance(item, dict):
+                    continue
+                df = _parse_nav_history_rows(item.get("data", []))
+                if df.empty:
+                    continue
+                histories[record.scheme_code] = df
+                _write_tigzig_history_cache(settings, record, df)
+        except Exception as exc:
+            logger.warning("TigZig NAV history batch failed for %d schemes: %s", len(batch), exc)
+    return histories
+
+
+def _enrich_from_tigzig_nav(settings: Settings, records: list[FundRecord]) -> None:
+    candidates = [
+        r for r in records if any(getattr(r, field) is None for field in (
+            "latest_nav", "cagr_1y_pct", "cagr_3y_pct", "cagr_5y_pct",
+            "volatility_pct", "max_drawdown_pct", "sharpe", "sortino",
+        )) and r.scheme_code
+    ]
+    if not candidates:
+        return
+    histories = _load_tigzig_histories(settings, candidates)
+    enriched = 0
+    for record in candidates:
+        history = histories.get(record.scheme_code)
+        if history is None or history.empty:
+            continue
+        metrics = _calculate_nav_metrics(history)
+        if not metrics:
+            continue
+        for field in ("latest_nav", "cagr_1y_pct", "cagr_3y_pct", "cagr_5y_pct", "volatility_pct", "max_drawdown_pct", "sharpe", "sortino"):
+            value = metrics.get(field)
+            if value is not None:
+                setattr(record, field, value)
+                record.data_sources[field] = "TigZig / AMFI NAV history"
+        if metrics.get("nav_date"):
+            record.nav_date = metrics["nav_date"]
+            record.data_sources["nav_date"] = "TigZig / AMFI NAV history"
+        record.nav_history_observations = metrics.get("nav_history_observations")
+        record.source_quality = max(record.source_quality, TIGZIG_NAV_SOURCE_QUALITY)
+        enriched += 1
+    logger.info("TigZig NAV history enrichment: enriched=%d/%d", enriched, len(candidates))
 
 
 def _parse_kaggle_date(value):
@@ -524,12 +778,15 @@ def _enrich_from_kaggle_snapshot(settings: Settings, records: list[FundRecord]) 
             value = values.get(field)
             if value is None or value == "":
                 continue
+            current_source = record.data_sources.get(field, "")
+            if getattr(record, field) is not None and not current_source.startswith("mftool"):
+                continue
             setattr(record, field, value)
             record.data_sources[field] = "Kaggle / mutual_fund_data.csv"
-        if values.get("amc"):
+        if values.get("amc") and (not record.amc or record.amc == "Unknown"):
             record.amc = values["amc"]
             record.data_sources["amc"] = "Kaggle / mutual_fund_data.csv"
-        if values.get("category"):
+        if values.get("category") and (not record.category or record.category == "Other"):
             record.category = values["category"]
             record.data_sources["category"] = "Kaggle / mutual_fund_data.csv"
         if values.get("scheme_nav_name"):
@@ -707,10 +964,13 @@ def _enrich_from_kaggle_nav(settings: Settings, records: list[FundRecord]) -> No
                 continue
             value = metrics.get(field)
             if value is not None:
+                current_source = record.data_sources.get(field, "")
+                if getattr(record, field) is not None and not current_source.startswith("mftool"):
+                    continue
                 setattr(record, field, value)
                 record.data_sources[field] = "Kaggle / mutual-fund-historic-nav-data"
                 changed = True
-        if record.nav_date is None and metrics.get("nav_date"):
+        if (record.nav_date is None or record.data_sources.get("nav_date", "").startswith("mftool")) and metrics.get("nav_date"):
             record.nav_date = metrics["nav_date"]
             record.data_sources["nav_date"] = "Kaggle / mutual-fund-historic-nav-data"
             changed = True
@@ -1461,19 +1721,28 @@ def build_fund_universe(settings: Settings, holdings: dict[str, Holding]) -> lis
 
     records.sort(key=lambda x: (x.category.lower(), x.scheme_name.lower()))
 
-    # Kaggle is the primary daily scheme snapshot and NAV-history source.
-    # mftool/AMFI is retained as a fallback for anything Kaggle does not cover.
+    # AMFI-derived providers are primary. TigZig supplies a daily scheme
+    # snapshot plus full per-scheme history; mftool/AMFI remains the direct
+    # fallback, followed by Creget/Kaggle archival sources when needed.
     try:
-        _enrich_from_kaggle_snapshot(settings, records)
-        _enrich_from_kaggle_nav(settings, records)
+        _enrich_from_tigzig_snapshot(settings, records)
+        _enrich_from_tigzig_nav(settings, records)
     except Exception as exc:
-        logger.warning("Kaggle primary enrichment failed; continuing with AMFI/mftool and mfdata: %s", exc)
+        logger.warning("TigZig primary enrichment failed; continuing with AMFI/mftool fallbacks: %s", exc)
 
     try:
         performance = _load_mftool_performance(mf, settings, records)
         _enrich_from_mftool_performance(records, performance)
     except Exception as exc:
         logger.warning("mftool performance enrichment failed: %s", exc)
+
+    # Retain the existing Kaggle layer as a tertiary fallback for environments
+    # where the AMFI-derived primary providers are temporarily unavailable.
+    try:
+        _enrich_from_kaggle_snapshot(settings, records)
+        _enrich_from_kaggle_nav(settings, records)
+    except Exception as exc:
+        logger.warning("Kaggle fallback enrichment failed: %s", exc)
 
     try:
         _enrich_from_mfdata(settings, records, holdings)
