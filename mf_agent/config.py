@@ -45,6 +45,7 @@ class PortfolioPolicy:
     min_cash_pct: float = 5.0
     max_gold_pct: float = 15.0
     max_fund_overlap_pct: float = 60.0
+    max_concentrated_funds: int = 5
 
 
 @dataclass(frozen=True)
@@ -115,6 +116,7 @@ def load_settings() -> Settings:
         min_cash_pct=_float("MIN_CASH_PCT", 5.0),
         max_gold_pct=_float("MAX_GOLD_PCT", 15.0),
         max_fund_overlap_pct=_float("MAX_FUND_OVERLAP_PCT", 60.0),
+        max_concentrated_funds=_int("MAX_CONCENTRATED_FUNDS", 5),
     )
 
     return Settings(

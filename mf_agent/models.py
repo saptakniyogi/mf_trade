@@ -56,7 +56,6 @@ class MacroSnapshot:
     nifty_smallcap: float | None = None
     gold_usd: float | None = None
     us_10y_yield_pct: float | None = None
-    india_10y_yield_pct: float | None = None
     sp500: float | None = None
     crude_change_1m_pct: float | None = None
     usd_inr_change_1m_pct: float | None = None
@@ -65,6 +64,8 @@ class MacroSnapshot:
     dii_flow_inr_cr: float | None = None
     inflation_pct: float | None = None
     repo_rate_pct: float | None = None
+    macro_sources: dict[str, str] = field(default_factory=dict)
+    fetched_at: str | None = None
     selected_topics: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:

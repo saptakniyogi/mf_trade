@@ -15,6 +15,8 @@ logger = logging.getLogger("mf_agent")
 
 def merge_reviews(result: dict, reviews: list[dict]) -> None:
     by_name = {r.get("scheme_name"): r for r in reviews}
+    allocation = result.get("allocation_plan", [])
+
     for fund in result["evaluated_funds"]:
         review = by_name.get(fund["scheme_name"])
         fund["llm_review"] = review
@@ -26,6 +28,24 @@ def merge_reviews(result: dict, reviews: list[dict]) -> None:
             fund["final_action"] = llm_action if llm_action else proposed
         else:
             fund["final_action"] = fund["action"]
+
+    # Carry the same evidence into the allocation plan. The allocation table is
+    # otherwise detached from the fund-review layer and cannot show why a fund
+    # was selected.
+    for item in allocation:
+        fund = next((x for x in result["evaluated_funds"] if x["scheme_name"] == item["scheme_name"]), None)
+        if not fund:
+            continue
+        score = fund.get("score", {})
+        review = by_name.get(item["scheme_name"])
+        item["reason"] = (
+            (review.get("final_comment") or (review.get("key_reasons") or [None])[0])
+            if review else None
+        ) or ((score.get("reasons_to_buy") or [None])[0]) or "Selected by the quantitative allocation engine based on score and portfolio constraints."
+        item["data_confidence"] = score.get("data_confidence")
+        item["data_warnings"] = score.get("data_warnings", [])
+        item["llm_review"] = review
+        item["final_action"] = fund.get("final_action", fund.get("action"))
 
 
 def main():
@@ -43,13 +63,21 @@ def main():
             for fund in engine_result["evaluated_funds"]:
                 fund["llm_review"] = None
                 fund["final_action"] = fund["action"]
+            for item in engine_result.get("allocation_plan", []):
+                fund = next((x for x in engine_result["evaluated_funds"] if x["scheme_name"] == item["scheme_name"]), None)
+                score = fund.get("score", {}) if fund else {}
+                item["reason"] = (score.get("reasons_to_buy") or [None])[0] or "Selected by the quantitative allocation engine."
+                item["data_confidence"] = score.get("data_confidence")
+                item["data_warnings"] = score.get("data_warnings", [])
+                item["llm_review"] = None
+                item["final_action"] = fund.get("action") if fund else item.get("action")
     else:
         for fund in engine_result["evaluated_funds"]:
             fund["llm_review"] = None
             fund["final_action"] = fund["action"]
+        merge_reviews(engine_result, [])
 
     output = {
-
         "metadata": {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "provider": "OpenRouter qualitative review" if reviews else "quantitative engine only",

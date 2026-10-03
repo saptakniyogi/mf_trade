@@ -4,7 +4,6 @@ import json
 import logging
 import random
 import re
-import sys
 import time
 
 import requests
@@ -27,7 +26,8 @@ Rules:
 5. You may downgrade a proposed action when there is a material contradiction, but explain why.
 6. Do not use recent performance alone as a reason to buy.
 7. Prefer WAIT over forcing a transaction when evidence is insufficient.
-8. Return JSON only.
+8. Every review must contain at least one useful reason or explicit data-gap explanation.
+9. Return JSON only.
 
 Output:
 {
@@ -98,12 +98,42 @@ class OpenRouterReviewer:
         return [], 0
 
     def review(self, engine_result: dict) -> tuple[list[dict], int]:
-        # Only send top-ranked candidates to reduce cost and keep context focused.
-        shortlist = engine_result.get("local_ranking", {}).get("llm_candidates") or engine_result["evaluated_funds"][:15]
+        evaluated = engine_result.get("evaluated_funds", [])
+        allocation = engine_result.get("allocation_plan", [])
+        allocation_names = {x.get("scheme_name") for x in allocation}
+
+        ranked = engine_result.get("local_ranking", {}).get("llm_candidates") or evaluated[:15]
+        ranked_by_name = {x.get("scheme_name"): x for x in ranked}
+
+        # Allocation candidates are always reviewed when LLM mode is enabled.
+        # Previously the LLM shortlist could exclude an allocated fund entirely,
+        # leaving the allocation UI without a qualitative reason.
+        shortlist = []
+        for item in allocation:
+            candidate = ranked_by_name.get(item.get("scheme_name"))
+            if candidate:
+                shortlist.append(candidate)
+            else:
+                candidate = next(
+                    (x for x in evaluated if x.get("scheme_name") == item.get("scheme_name")),
+                    None,
+                )
+                if candidate:
+                    shortlist.append(candidate)
+        seen = {x.get("scheme_name") for x in shortlist}
+        for item in ranked:
+            if item.get("scheme_name") not in seen:
+                shortlist.append(item)
+                seen.add(item.get("scheme_name"))
+        for item in evaluated:
+            if item.get("scheme_name") in allocation_names and item.get("scheme_name") not in seen:
+                shortlist.append(item)
+                seen.add(item.get("scheme_name"))
+
+        shortlist = shortlist[: max(15, len(allocation))]
+
         market = engine_result.get("market", {})
         relevant_news = market.get("relevant_news", [])[:8]
-        # Shared context is sent once per batch instead of being duplicated
-        # inside every fund object. This materially reduces prompt tokens.
         shared_context = {
             "market_regime": market.get("regime", {}),
             "macro": market.get("macro", {}),
@@ -112,13 +142,18 @@ class OpenRouterReviewer:
                 for article in relevant_news
             ],
         }
-        candidates = [
-            {
+        candidates = []
+        for x in shortlist:
+            score = x.get("score", {})
+            candidates.append({
                 "scheme_name": x["scheme_name"],
                 "category": x["category"],
                 "amc": x.get("amc"),
                 "action": x["action"],
-                "score": x["score"],
+                "score": score,
+                "reasons_to_buy": score.get("reasons_to_buy", []),
+                "reasons_not_to_buy": score.get("reasons_not_to_buy", []),
+                "data_warnings": score.get("data_warnings", []),
                 "fund_metrics": {
                     k: x["fund_metrics"].get(k)
                     for k in (
@@ -132,17 +167,14 @@ class OpenRouterReviewer:
                 "allocation": x["allocation"],
                 "vector_similarity": x.get("vector_similarity"),
                 "local_rank": x.get("local_rank"),
-            }
-            for x in shortlist
-        ]
-        candidates = {"context": shared_context, "funds": candidates}
+            })
+
+        context = {"context": shared_context, "funds": candidates}
         all_reviews = []
         tokens = 0
-        fund_items = candidates["funds"]
-        context = candidates["context"]
-        batches = list(chunked(fund_items, self.settings.batch_size))
+        batches = list(chunked(candidates, self.settings.batch_size))
         for index, batch in enumerate(batches):
-            reviews, used = self.review_batch([{"context": context, "funds": batch}])
+            reviews, used = self.review_batch([{"context": shared_context, "funds": batch}])
             all_reviews.extend(reviews)
             tokens += used
             if index < len(batches) - 1:
