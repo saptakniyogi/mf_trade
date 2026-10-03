@@ -1150,9 +1150,11 @@ with tab_overview:
     if allocation:
         allocation_rows = []
         for item in allocation:
-            score = item.get("score") or {}
+            raw_score = item.get("score")
+            score = raw_score if isinstance(raw_score, dict) else {}
             review = item.get("llm_review") or {}
             warnings = item.get("data_warnings") or score.get("data_warnings") or []
+            overall_score = score.get("overall") if score else raw_score
 
             allocation_rows.append(
                 {
@@ -1162,7 +1164,7 @@ with tab_overview:
                     "Action": item.get("final_action") or item.get("action"),
                     "Allocation %": item.get("allocation_pct"),
                     "Capital": money(item.get("capital_required")),
-                    "Score": score.get("overall", item.get("score")),
+                    "Score": overall_score,
                     "Data confidence": score.get("data_confidence", item.get("data_confidence")),
                     "Reason": allocation_reason(item),
                     "Data gaps": "; ".join(str(x) for x in warnings) if warnings else "None reported",
