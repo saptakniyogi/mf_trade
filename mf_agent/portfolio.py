@@ -4,20 +4,29 @@ from collections import defaultdict
 
 from .config import PortfolioPolicy
 from .models import FundRecord, Holding, FundScore
-from .utils import clamp
 
 
-def existing_exposure(holdings: dict[str, Holding], funds: list[FundRecord]) -> dict:
+def existing_exposure(
+    holdings: dict[str, Holding],
+    funds: list[FundRecord],
+) -> dict:
     total = sum(max(0.0, h.current_value) for h in holdings.values())
     by_category = defaultdict(float)
     by_amc = defaultdict(float)
+
     for name, holding in holdings.items():
-        fund = next((f for f in funds if f.scheme_name.lower() == name.lower()), None)
+        fund = next(
+            (f for f in funds if f.scheme_name.lower() == name.lower()),
+            None,
+        )
+
         if not fund or total <= 0:
             continue
+
         weight = holding.current_value / total * 100
         by_category[fund.category] += weight
         by_amc[fund.amc] += weight
+
     return {
         "total_value": total,
         "category_weights": dict(by_category),
@@ -31,7 +40,7 @@ def _candidate_capacity(
     amc: defaultdict,
     policy: PortfolioPolicy,
 ) -> float:
-    """Return the maximum additional portfolio percentage available for a fund."""
+    """Return maximum additional portfolio percentage available."""
     cat = fund.category
     max_cat = policy.max_category_pct
     cat_lower = cat.lower()
@@ -45,7 +54,46 @@ def _candidate_capacity(
 
     available_cat = max(0.0, max_cat - category[cat])
     available_amc = max(0.0, policy.max_single_amc_pct - amc[fund.amc])
-    return max(0.0, min(policy.max_single_fund_pct, available_cat, available_amc))
+
+    return max(
+        0.0,
+        min(
+            policy.max_single_fund_pct,
+            available_cat,
+            available_amc,
+        ),
+    )
+
+
+def _eligible_candidates(
+    candidates: list[tuple[FundRecord, FundScore]],
+    category: defaultdict,
+    amc: defaultdict,
+    policy: PortfolioPolicy,
+) -> list[tuple[FundRecord, FundScore]]:
+    """Apply hard evidence and portfolio gates before any capital is allocated."""
+    eligible = []
+
+    for fund, score in sorted(
+        candidates,
+        key=lambda x: x[1].ranking_score,
+        reverse=True,
+    ):
+        if not score.allocation_eligible:
+            continue
+
+        if score.evidence_status != "ELIGIBLE":
+            continue
+
+        if score.ranking_score < 50:
+            continue
+
+        if _candidate_capacity(fund, category, amc, policy) <= 0:
+            continue
+
+        eligible.append((fund, score))
+
+    return eligible
 
 
 def allocation_for_candidates(
@@ -60,56 +108,62 @@ def allocation_for_candidates(
     category = defaultdict(float, exposure["category_weights"])
     amc = defaultdict(float, exposure["amc_weights"])
 
-    ranked = sorted(candidates, key=lambda x: x[1].ranking_score, reverse=True)
+    ranked = sorted(
+        candidates,
+        key=lambda x: x[1].ranking_score,
+        reverse=True,
+    )
     mode = str(mode or "DIVERSIFIED").upper()
 
+    eligible = _eligible_candidates(
+        ranked,
+        category,
+        amc,
+        policy,
+    )
+
+    if not eligible or deployable_cash <= 0:
+        return []
+
     if mode == "CONCENTRATED":
-        # Concentrated mode must explicitly limit the number of funds. The old
-        # implementation only multiplied each normalized weight by 1.25, which
-        # still allowed every qualifying candidate into the allocation plan.
         max_funds = max(1, int(policy.max_concentrated_funds))
         target_pct = max(
             0.0,
             min(100.0, 100.0 - max(0.0, policy.min_cash_pct)),
         )
 
-        eligible: list[tuple[FundRecord, FundScore]] = []
-        for fund, score in ranked:
-            if score.overall < 60 or score.data_confidence < 50:
-                continue
-            if _candidate_capacity(fund, category, amc, policy) <= 0:
-                continue
-            eligible.append((fund, score))
-            if len(eligible) >= max_funds:
-                break
+        eligible = eligible[:max_funds]
 
-        if not eligible:
-            return []
-
-        # Allocate in small increments to the strongest candidates. This keeps
-        # the result concentrated while dynamically enforcing fund, category,
-        # and AMC exposure limits after every increment.
         strengths = {
             fund.scheme_name: max(1.0, score.ranking_score - 50.0)
             for fund, score in eligible
         }
-        allocations = {fund.scheme_name: 0.0 for fund, _ in eligible}
+
+        allocations = {
+            fund.scheme_name: 0.0
+            for fund, _ in eligible
+        }
+
         remaining_pct = target_pct
         step_pct = 0.25
 
         while remaining_pct > 1e-9:
             available = []
+
             for fund, score in eligible:
-                capacity = _candidate_capacity(fund, category, amc, policy)
+                capacity = _candidate_capacity(
+                    fund,
+                    category,
+                    amc,
+                    policy,
+                )
+
                 if capacity > allocations[fund.scheme_name] + 1e-9:
                     available.append((fund, score, capacity))
 
             if not available:
                 break
 
-            # Highest ranking strength receives the next increment. A small
-            # decrement to already-allocated strength prevents one fund from
-            # monopolizing the entire target while still rewarding rank.
             available.sort(
                 key=lambda item: (
                     strengths[item[0].scheme_name]
@@ -118,12 +172,18 @@ def allocation_for_candidates(
                 ),
                 reverse=True,
             )
+
             fund, score, capacity = available[0]
+
             increment = min(
                 step_pct,
                 remaining_pct,
-                max(0.0, capacity - allocations[fund.scheme_name]),
+                max(
+                    0.0,
+                    capacity - allocations[fund.scheme_name],
+                ),
             )
+
             if increment <= 1e-9:
                 break
 
@@ -133,62 +193,125 @@ def allocation_for_candidates(
             remaining_pct -= increment
 
         selected = []
+
         for fund, score in eligible:
             pct = allocations[fund.scheme_name]
+
             if pct <= 0:
                 continue
 
-            capital = round(deployable_cash * pct / 100.0, 2)
+            capital = round(
+                deployable_cash * pct / 100.0,
+                2,
+            )
+
             if capital <= 0:
                 continue
 
-            selected.append({
-                "scheme_name": fund.scheme_name,
-                "category": fund.category,
-                "amc": fund.amc,
-                "score": score.overall,
-                "allocation_pct_of_new_cash": round(pct, 2),
-                "capital_required": capital,
-                "action": "ACCUMULATE" if fund.scheme_name in holdings else "BUY",
-            })
+            selected.append(
+                {
+                    "scheme_name": fund.scheme_name,
+                    "category": fund.category,
+                    "amc": fund.amc,
+                    "score": score.overall,
+                    "ranking_score": score.ranking_score,
+                    "allocation_pct_of_new_cash": round(pct, 2),
+                    "capital_required": capital,
+                    "action": (
+                        "ACCUMULATE"
+                        if fund.scheme_name in holdings
+                        else "BUY"
+                    ),
+                    "evidence_status": score.evidence_status,
+                    "data_confidence": score.data_confidence,
+                }
+            )
 
         return selected
 
-    # Existing diversified behavior, with the configured minimum cash reserve
-    # now actually respected.
-    selected = []
     target_deployable_cash = deployable_cash * (
-        1.0 - max(0.0, min(100.0, policy.min_cash_pct)) / 100.0
+        1.0 - max(
+            0.0,
+            min(100.0, policy.min_cash_pct),
+        ) / 100.0
     )
-    remaining_target_cash = max(0.0, target_deployable_cash)
-    total_score = sum(max(0.0, score.ranking_score - 50) for _, score in ranked)
 
-    for fund, score in ranked:
-        if remaining_target_cash <= 0 or score.overall < 60 or score.data_confidence < 50:
-            continue
+    remaining_target_cash = max(
+        0.0,
+        target_deployable_cash,
+    )
 
-        cap = _candidate_capacity(fund, category, amc, policy)
+    total_score = sum(
+        max(0.0, score.ranking_score - 50.0)
+        for _, score in eligible
+    )
+
+    selected = []
+
+    for fund, score in eligible:
+        if remaining_target_cash <= 0:
+            break
+
+        cap = _candidate_capacity(
+            fund,
+            category,
+            amc,
+            policy,
+        )
+
         if cap <= 0:
             continue
 
-        raw_weight = ((score.ranking_score - 50) / max(total_score, 1.0)) * 100
-        weight = min(cap, max(2.0, raw_weight))
-        capital = round(target_deployable_cash * weight / 100.0, 2)
-        capital = min(capital, remaining_target_cash)
-        weight = capital / deployable_cash * 100.0 if deployable_cash else 0.0
+        raw_weight = (
+            (
+                score.ranking_score - 50.0
+            )
+            / max(total_score, 1.0)
+        ) * 100.0
+
+        weight = min(
+            cap,
+            max(2.0, raw_weight),
+        )
+
+        capital = round(
+            target_deployable_cash * weight / 100.0,
+            2,
+        )
+
+        capital = min(
+            capital,
+            remaining_target_cash,
+        )
+
+        weight = (
+            capital / deployable_cash * 100.0
+            if deployable_cash
+            else 0.0
+        )
 
         if capital <= 0:
             continue
 
-        selected.append({
-            "scheme_name": fund.scheme_name,
-            "category": fund.category,
-            "amc": fund.amc,
-            "score": score.overall,
-            "allocation_pct_of_new_cash": round(weight, 2),
-            "capital_required": round(capital, 2),
-            "action": "ACCUMULATE" if fund.scheme_name in holdings else "BUY",
-        })
+        selected.append(
+            {
+                "scheme_name": fund.scheme_name,
+                "category": fund.category,
+                "amc": fund.amc,
+                "score": score.overall,
+                "ranking_score": score.ranking_score,
+                "allocation_pct_of_new_cash": round(weight, 2),
+                "capital_required": round(capital, 2),
+                "action": (
+                    "ACCUMULATE"
+                    if fund.scheme_name in holdings
+                    else "BUY"
+                ),
+                "evidence_status": score.evidence_status,
+                "data_confidence": score.data_confidence,
+            }
+        )
+
         remaining_target_cash -= capital
         category[fund.category] += weight
         amc[fund.amc] += weight
