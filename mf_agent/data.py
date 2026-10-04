@@ -19,6 +19,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from .config import Settings
+from .mfapi_provider import MFAPI_ENABLED, fetch_histories, scheme_metadata
 from .models import FundRecord, Holding
 from .utils import safe_float
 
@@ -61,11 +62,11 @@ CATEGORY_RULES = [
 
 MFDATA_BASE_URL = os.getenv("MF_DATA_API_URL", "https://mfdata.in").rstrip("/")
 MFDATA_CACHE_TTL_HOURS = max(1.0, float(os.getenv("MF_DATA_CACHE_TTL_HOURS", "24")))
-MFDATA_FAMILY_ENRICHMENT_LIMIT = max(0, min(5, int(os.getenv("MF_DATA_FAMILY_ENRICHMENT_LIMIT", "5"))))
-MFDATA_TIMEOUT_SECONDS = max(3, min(5, int(os.getenv("MF_DATA_TIMEOUT_SECONDS", "5"))))
+MFDATA_FAMILY_ENRICHMENT_LIMIT = max(0, min(20, int(os.getenv("MF_DATA_FAMILY_ENRICHMENT_LIMIT", "20"))))
+MFDATA_TIMEOUT_SECONDS = max(3, min(15, int(os.getenv("MF_DATA_TIMEOUT_SECONDS", "10"))))
 MFDATA_BULK_CHUNK_SIZE = max(25, min(100, int(os.getenv("MF_DATA_BULK_CHUNK_SIZE", "50"))))
 MFDATA_MAX_WORKERS = max(1, min(12, int(os.getenv("MF_DATA_MAX_WORKERS", "6"))))
-MFDATA_INDIVIDUAL_FALLBACK_LIMIT = max(0, min(10, int(os.getenv("MF_DATA_INDIVIDUAL_FALLBACK_LIMIT", "10"))))
+MFDATA_INDIVIDUAL_FALLBACK_LIMIT = max(0, min(20, int(os.getenv("MF_DATA_INDIVIDUAL_FALLBACK_LIMIT", "20"))))
 MFTOOL_PERFORMANCE_CACHE_TTL_HOURS = max(1.0, float(os.getenv("MFTOOL_PERFORMANCE_CACHE_TTL_HOURS", "24")))
 
 # TigZig publishes an AMFI-derived, normalized scheme snapshot and historical
@@ -406,7 +407,6 @@ def _load_tigzig_histories(settings: Settings, records: list[FundRecord]) -> dic
             missing.append(record)
     if not missing:
         return histories
-
     for start in range(0, len(missing), TIGZIG_NAV_BULK_SIZE):
         batch = missing[start:start + TIGZIG_NAV_BULK_SIZE]
         schemes = ",".join(_kaggle_code_key(r.scheme_code) for r in batch if r.scheme_code)
@@ -433,12 +433,7 @@ def _load_tigzig_histories(settings: Settings, records: list[FundRecord]) -> dic
 
 
 def _enrich_from_tigzig_nav(settings: Settings, records: list[FundRecord]) -> None:
-    candidates = [
-        r for r in records if any(getattr(r, field) is None for field in (
-            "latest_nav", "cagr_1y_pct", "cagr_3y_pct", "cagr_5y_pct",
-            "volatility_pct", "max_drawdown_pct", "sharpe", "sortino",
-        )) and r.scheme_code
-    ]
+    candidates = [r for r in records if any(getattr(r, field) is None for field in ("latest_nav", "cagr_1y_pct", "cagr_3y_pct", "cagr_5y_pct", "volatility_pct", "max_drawdown_pct", "sharpe", "sortino")) and r.scheme_code]
     if not candidates:
         return
     histories = _load_tigzig_histories(settings, candidates)
@@ -453,11 +448,9 @@ def _enrich_from_tigzig_nav(settings: Settings, records: list[FundRecord]) -> No
         for field in ("latest_nav", "cagr_1y_pct", "cagr_3y_pct", "cagr_5y_pct", "volatility_pct", "max_drawdown_pct", "sharpe", "sortino"):
             value = metrics.get(field)
             if value is not None:
-                setattr(record, field, value)
-                record.data_sources[field] = "TigZig / AMFI NAV history"
+                setattr(record, field, value); record.data_sources[field] = "TigZig / AMFI NAV history"
         if metrics.get("nav_date"):
-            record.nav_date = metrics["nav_date"]
-            record.data_sources["nav_date"] = "TigZig / AMFI NAV history"
+            record.nav_date = metrics["nav_date"]; record.data_sources["nav_date"] = "TigZig / AMFI NAV history"
         record.nav_history_observations = metrics.get("nav_history_observations")
         record.source_quality = max(record.source_quality, TIGZIG_NAV_SOURCE_QUALITY)
         enriched += 1
@@ -469,8 +462,6 @@ def _parse_kaggle_date(value):
     if not text:
         return pd.NaT
     try:
-        # ISO dates are common in exported datasets; AMFI-style dates are
-        # commonly DD-MM-YYYY/DD/MM/YYYY. Handle both without ambiguity.
         if len(text) >= 8 and text[0:4].isdigit() and text[4] in {"-", "/"}:
             return pd.to_datetime(text, errors="coerce", dayfirst=False)
         return pd.to_datetime(text, errors="coerce", dayfirst=True)
@@ -486,7 +477,6 @@ def _kaggle_code_key(value) -> str:
 
 
 def _kaggle_name_key(value: str) -> str:
-    """Create a conservative scheme-name key while preserving plan/option identity."""
     text = " ".join(str(value or "").lower().replace("&", "and").split())
     for token in ("-", "/", "(", ")", ",", "."):
         text = text.replace(token, " ")
@@ -494,12 +484,8 @@ def _kaggle_name_key(value: str) -> str:
 
 
 def _kaggle_base_name_key(value: str) -> str:
-    """Create a fallback key for datasets that omit direct/regular plan labels."""
     text = _kaggle_name_key(value)
-    tokens = {
-        "direct", "regular", "plan", "growth", "option", "dividend", "idcw",
-        "reinvestment", "reinvest", "bonus",
-    }
+    tokens = {"direct", "regular", "plan", "growth", "option", "dividend", "idcw", "reinvestment", "reinvest", "bonus"}
     return " ".join(token for token in text.split() if token not in tokens)
 
 
@@ -518,72 +504,50 @@ def _kaggle_history_cache_path(settings: Settings, record: FundRecord) -> Path:
 def _read_kaggle_history_cache(settings: Settings, record: FundRecord) -> pd.DataFrame | None:
     path = _kaggle_history_cache_path(settings, record)
     try:
-        if not path.exists():
-            return None
-        if time.time() - path.stat().st_mtime > KAGGLE_NAV_CACHE_TTL_HOURS * 3600:
+        if not path.exists() or time.time() - path.stat().st_mtime > KAGGLE_NAV_CACHE_TTL_HOURS * 3600:
             return None
         payload = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict) or not isinstance(payload.get("rows"), list):
             return None
-        rows = []
+        rows=[]
         for item in payload["rows"]:
-            if not isinstance(item, dict):
-                continue
-            date_value = pd.to_datetime(item.get("date"), errors="coerce")
-            nav_value = safe_float(item.get("nav"))
-            if pd.notna(date_value) and nav_value is not None and nav_value > 0:
-                rows.append((date_value, nav_value))
-        if not rows:
-            return None
-        return pd.DataFrame(rows, columns=["date", "nav"]).sort_values("date").reset_index(drop=True)
+            if not isinstance(item, dict): continue
+            date_value=pd.to_datetime(item.get("date"), errors="coerce"); nav_value=safe_float(item.get("nav"))
+            if pd.notna(date_value) and nav_value is not None and nav_value > 0: rows.append((date_value, nav_value))
+        if not rows: return None
+        return pd.DataFrame(rows, columns=["date","nav"]).sort_values("date").reset_index(drop=True)
     except Exception:
         return None
 
 
 def _write_kaggle_history_cache(settings: Settings, record: FundRecord, df: pd.DataFrame) -> None:
     try:
-        rows = [
-            {"date": row.date.strftime("%Y-%m-%d"), "nav": float(row.nav)}
-            for row in df.itertuples(index=False)
-        ]
-        path = _kaggle_history_cache_path(settings, record)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"rows": rows}, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(path)
+        rows=[{"date":row.date.strftime("%Y-%m-%d"),"nav":float(row.nav)} for row in df.itertuples(index=False)]
+        path=_kaggle_history_cache_path(settings, record); tmp=path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"rows":rows}, ensure_ascii=False), encoding="utf-8"); tmp.replace(path)
     except Exception as exc:
         logger.debug("Could not cache Kaggle NAV history for %s: %s", record.scheme_name, exc)
 
 
 def _kaggle_file_columns(path: Path) -> tuple[list[str], str, str | None] | None:
-    suffix = path.suffix.lower()
+    suffix=path.suffix.lower()
     try:
-        if suffix in {".csv", ".tsv"}:
-            sep = "\t" if suffix == ".tsv" else ","
+        if suffix in {".csv",".tsv"}:
+            sep="\t" if suffix==".tsv" else ","
             return list(pd.read_csv(path, sep=sep, nrows=0).columns), sep, None
-        if suffix == ".parquet":
-            # Inspect the Parquet schema without materialising the 100+ MB NAV
-            # history. pandas metadata tells us which field is stored as the
-            # DataFrame index.
+        if suffix==".parquet":
             import pyarrow.parquet as pq
-
-            parquet_file = pq.ParquetFile(path)
-            columns = list(parquet_file.schema_arrow.names)
-            index_name = None
-            metadata = parquet_file.schema_arrow.metadata or {}
-            pandas_meta = metadata.get(b"pandas")
+            pf=pq.ParquetFile(path); columns=list(pf.schema_arrow.names); index_name=None
+            meta=pf.schema_arrow.metadata or {}; pandas_meta=meta.get(b"pandas")
             if pandas_meta:
                 try:
-                    pandas_payload = json.loads(pandas_meta.decode("utf-8"))
-                    index_columns = pandas_payload.get("index_columns", [])
-                    if index_columns and isinstance(index_columns[0], str):
-                        index_name = index_columns[0]
-                except Exception:
-                    pass
-            return columns, "parquet", index_name
+                    idx=json.loads(pandas_meta.decode("utf-8")).get("index_columns",[])
+                    if idx and isinstance(idx[0],str): index_name=idx[0]
+                except Exception: pass
+            return columns,"parquet",index_name
         return None
     except Exception as exc:
-        logger.warning("Could not inspect Kaggle NAV file %s: %s", path, exc)
-        return None
+        logger.warning("Could not inspect Kaggle NAV file %s: %s", path, exc); return None
 
 
 def _find_kaggle_column(columns: list[str], candidates: tuple[str, ...]) -> str | None:
@@ -602,202 +566,81 @@ def _kaggle_dataset_files(dataset_path: str) -> list[Path]:
     root = Path(dataset_path)
     if not root.exists():
         return []
-    return sorted(
-        path for path in root.rglob("*")
-        if path.is_file() and path.suffix.lower() in {".csv", ".tsv", ".parquet"}
-    )
+    return sorted(path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in {".csv", ".tsv", ".parquet"})
 
 
-def _kaggle_refresh_marker(settings: Settings) -> Path:
-    return _kaggle_cache_root(settings) / "refresh_state.json"
-
+def _kaggle_refresh_marker(settings: Settings) -> Path: return _kaggle_cache_root(settings) / "refresh_state.json"
 
 def _read_kaggle_refresh_state(settings: Settings) -> dict:
-    path = _kaggle_refresh_marker(settings)
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        return payload if isinstance(payload, dict) else {}
-    except Exception:
-        return {}
-
+        payload=json.loads(_kaggle_refresh_marker(settings).read_text(encoding="utf-8")); return payload if isinstance(payload,dict) else {}
+    except Exception: return {}
 
 def _write_kaggle_refresh_state(settings: Settings, *, refreshed_at: str, dataset_path: str, files: list[Path]) -> None:
-    payload = {
-        "refreshed_at": refreshed_at,
-        "refresh_date": refreshed_at[:10],
-        "dataset": KAGGLE_NAV_DATASET,
-        "dataset_path": dataset_path,
-        "files": [str(path) for path in files],
-    }
-    path = _kaggle_refresh_marker(settings)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
-
+    payload={"refreshed_at":refreshed_at,"refresh_date":refreshed_at[:10],"dataset":KAGGLE_NAV_DATASET,"dataset_path":dataset_path,"files":[str(path) for path in files]}
+    path=_kaggle_refresh_marker(settings); tmp=path.with_suffix(".tmp"); tmp.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding="utf-8"); tmp.replace(path)
 
 def _kaggle_should_refresh(settings: Settings) -> bool:
-    state = _read_kaggle_refresh_state(settings)
-    refresh_date = str(state.get("refresh_date") or "")
-    today = dt.date.today()
-    if refresh_date == today.isoformat():
-        return False
-    if today.weekday() < 5:
-        return True
-    return KAGGLE_REFRESH_WEEKENDS
-
+    state=_read_kaggle_refresh_state(settings); refresh_date=str(state.get("refresh_date") or ""); today=dt.date.today()
+    if refresh_date==today.isoformat(): return False
+    return today.weekday()<5 or KAGGLE_REFRESH_WEEKENDS
 
 def _kaggle_existing_dataset_files(settings: Settings) -> list[Path]:
     return _kaggle_dataset_files(str(_kaggle_cache_root(settings) / "dataset"))
 
-
 def _download_kaggle_nav_dataset(settings: Settings) -> list[Path]:
-    if not KAGGLE_NAV_ENABLED:
-        return []
-    try:
-        import kagglehub
+    if not KAGGLE_NAV_ENABLED: return []
+    try: import kagglehub
     except ImportError:
-        logger.info("Kaggle NAV backup disabled because kagglehub is not installed.")
-        return []
-
-    output_dir = _kaggle_cache_root(settings) / "dataset"
-    existing = _kaggle_existing_dataset_files(settings)
-    force_download = _kaggle_should_refresh(settings)
-    if existing and not force_download:
-        state = _read_kaggle_refresh_state(settings)
-        logger.info(
-            "Kaggle dataset cache is current for %s; using local snapshot (refreshed=%s)",
-            dt.date.today().isoformat(),
-            state.get("refreshed_at", "unknown"),
-        )
-        return existing
-
+        logger.info("Kaggle NAV backup disabled because kagglehub is not installed."); return []
+    output_dir=_kaggle_cache_root(settings)/"dataset"; existing=_kaggle_existing_dataset_files(settings); force_download=_kaggle_should_refresh(settings)
+    if existing and not force_download: return existing
     try:
-        dataset_path = kagglehub.dataset_download(
-            KAGGLE_NAV_DATASET,
-            output_dir=str(output_dir),
-            force_download=force_download,
-        )
-        files = _kaggle_dataset_files(dataset_path)
-        if not files:
-            logger.warning("Kaggle NAV dataset downloaded but no CSV/TSV/Parquet files were found: %s", dataset_path)
-            return existing
-        now = dt.datetime.now(dt.timezone.utc).isoformat()
-        _write_kaggle_refresh_state(settings, refreshed_at=now, dataset_path=dataset_path, files=files)
-        logger.info(
-            "Kaggle dataset refreshed: %s (%d data files); force_download=%s",
-            dataset_path,
-            len(files),
-            force_download,
-        )
-        return files
+        dataset_path=kagglehub.dataset_download(KAGGLE_NAV_DATASET, output_dir=str(output_dir), force_download=force_download); files=_kaggle_dataset_files(dataset_path)
+        if not files: return existing
+        now=dt.datetime.now(dt.timezone.utc).isoformat(); _write_kaggle_refresh_state(settings,refreshed_at=now,dataset_path=dataset_path,files=files); return files
     except Exception as exc:
-        logger.warning(
-            "Kaggle NAV backup unavailable for %s: %s. Set KAGGLE_API_TOKEN if Kaggle requests authentication.",
-            KAGGLE_NAV_DATASET,
-            exc,
-        )
-        return []
+        logger.warning("Kaggle NAV backup unavailable for %s: %s", KAGGLE_NAV_DATASET, exc); return []
 
 
 def _load_kaggle_scheme_snapshot(settings: Settings, records: list[FundRecord]) -> dict[str, dict]:
-    """Load current scheme metadata from Kaggle's daily snapshot.
-
-    ``mutual_fund_data.csv`` is the primary source for current scheme metadata.
-    AMFI/mftool and mfdata only fill fields that Kaggle does not provide.
-    """
-    targets_by_code = {_kaggle_code_key(r.scheme_code): r for r in records if r.scheme_code}
-    targets_by_name = {_kaggle_name_key(r.scheme_name): r for r in records}
-    files = _download_kaggle_nav_dataset(settings)
-    if not files:
-        return {}
-
-    snapshot_files = [p for p in files if "mutual_fund_data" in p.name.lower() and p.suffix.lower() == ".csv"]
-    if not snapshot_files:
-        logger.warning("Kaggle scheme snapshot file mutual_fund_data.csv was not found.")
-        return {}
-
-    path = snapshot_files[0]
-    try:
-        frame = pd.read_csv(path, low_memory=False)
-    except Exception as exc:
-        logger.warning("Could not read Kaggle scheme snapshot %s: %s", path, exc)
-        return {}
-
-    code_col = _find_kaggle_column(list(frame.columns), ("scheme code", "scheme_code", "amfi code", "amfi_code", "code"))
-    name_col = _find_kaggle_column(list(frame.columns), ("scheme name", "scheme_name", "fund name", "fund_name", "name"))
-    if not code_col and not name_col:
-        logger.warning("Kaggle scheme snapshot has no usable Scheme_Code/Scheme_Name column: %s", list(frame.columns))
-        return {}
-
-    def col(*names: str) -> str | None:
-        return _find_kaggle_column(list(frame.columns), names)
-
-    amc_col = col("amc")
-    category_col = col("scheme category", "scheme_category", "category")
-    nav_col = col("nav", "net asset value", "net_asset_value")
-    nav_date_col = col("latest nav date", "latest_nav_date", "nav date", "nav_date")
-    launch_col = col("launch date", "launch_date", "inception date", "inception_date")
-    aum_col = col("average aum cr", "average_aum_cr", "aum cr", "aum_inr_cr", "aum")
-    plan_col = col("scheme nav name", "scheme_nav_name")
-
-    matched = 0
-    result: dict[str, dict] = {}
+    targets_by_code={_kaggle_code_key(r.scheme_code):r for r in records if r.scheme_code}; targets_by_name={_kaggle_name_key(r.scheme_name):r for r in records}; files=_download_kaggle_nav_dataset(settings)
+    if not files: return {}
+    snapshot_files=[p for p in files if "mutual_fund_data" in p.name.lower() and p.suffix.lower()==".csv"]
+    if not snapshot_files: return {}
+    try: frame=pd.read_csv(snapshot_files[0],low_memory=False)
+    except Exception as exc: logger.warning("Could not read Kaggle scheme snapshot: %s",exc); return {}
+    columns=list(frame.columns); code_col=_find_kaggle_column(columns,("scheme code","scheme_code","amfi code","amfi_code","code")); name_col=_find_kaggle_column(columns,("scheme name","scheme_name","fund name","fund_name","name"))
+    if not code_col and not name_col: return {}
+    def col(*names): return _find_kaggle_column(columns,names)
+    amc_col=col("amc"); category_col=col("scheme category","scheme_category","category"); nav_col=col("nav","net asset value","net_asset_value"); nav_date_col=col("latest nav date","latest_nav_date","nav date","nav_date"); launch_col=col("launch date","launch_date","inception date","inception_date"); aum_col=col("average aum cr","average_aum_cr","aum cr","aum_inr_cr","aum"); plan_col=col("scheme nav name","scheme_nav_name")
+    result={}; matched=0
     for row in frame.to_dict(orient="records"):
-        code = _kaggle_code_key(row.get(code_col)) if code_col else ""
-        name = str(row.get(name_col) or "").strip() if name_col else ""
-        record = targets_by_code.get(code) if code else None
-        if record is None and name:
-            record = targets_by_name.get(_kaggle_name_key(name))
-        if record is None:
-            continue
-
-        key = record.scheme_code or record.scheme_name
-        values = {
-            "scheme_name": name or record.scheme_name,
-            "amc": str(row.get(amc_col) or "").strip() if amc_col else "",
-            "category": str(row.get(category_col) or "").strip() if category_col else "",
-            "latest_nav": safe_float(row.get(nav_col)) if nav_col else None,
-            "nav_date": str(row.get(nav_date_col) or "").strip() if nav_date_col else "",
-            "inception_date": str(row.get(launch_col) or "").strip() if launch_col else "",
-            "aum_inr_cr": safe_float(row.get(aum_col)) if aum_col else None,
-            "scheme_nav_name": str(row.get(plan_col) or "").strip() if plan_col else "",
-        }
-        result[key] = values
-        matched += 1
-
-    logger.info("Kaggle scheme snapshot matched %d/%d selected funds.", matched, len(records))
-    return result
+        code=_kaggle_code_key(row.get(code_col)) if code_col else ""; name=str(row.get(name_col) or "").strip() if name_col else ""; record=targets_by_code.get(code) if code else None
+        if record is None and name: record=targets_by_name.get(_kaggle_name_key(name))
+        if record is None: continue
+        key=record.scheme_code or record.scheme_name; result[key]={"scheme_name":name or record.scheme_name,"amc":str(row.get(amc_col) or "").strip() if amc_col else "","category":str(row.get(category_col) or "").strip() if category_col else "","latest_nav":safe_float(row.get(nav_col)) if nav_col else None,"nav_date":str(row.get(nav_date_col) or "").strip() if nav_date_col else "","inception_date":str(row.get(launch_col) or "").strip() if launch_col else "","aum_inr_cr":safe_float(row.get(aum_col)) if aum_col else None,"scheme_nav_name":str(row.get(plan_col) or "").strip() if plan_col else ""}; matched+=1
+    logger.info("Kaggle scheme snapshot matched %d/%d selected funds.",matched,len(records)); return result
 
 
 def _enrich_from_kaggle_snapshot(settings: Settings, records: list[FundRecord]) -> None:
-    snapshot = _load_kaggle_scheme_snapshot(settings, records)
+    snapshot=_load_kaggle_scheme_snapshot(settings,records)
     for record in records:
-        values = snapshot.get(record.scheme_code or record.scheme_name)
-        if not values:
-            continue
-        for field in ("latest_nav", "nav_date", "aum_inr_cr", "inception_date"):
-            value = values.get(field)
-            if value is None or value == "":
-                continue
-            current_source = record.data_sources.get(field, "")
-            if getattr(record, field) is not None and not current_source.startswith("mftool"):
-                continue
-            setattr(record, field, value)
-            record.data_sources[field] = "Kaggle / mutual_fund_data.csv"
-        if values.get("amc") and (not record.amc or record.amc == "Unknown"):
-            record.amc = values["amc"]
-            record.data_sources["amc"] = "Kaggle / mutual_fund_data.csv"
-        if values.get("category") and (not record.category or record.category == "Other"):
-            record.category = values["category"]
-            record.data_sources["category"] = "Kaggle / mutual_fund_data.csv"
+        values=snapshot.get(record.scheme_code or record.scheme_name)
+        if not values: continue
+        for field in ("latest_nav","nav_date","aum_inr_cr","inception_date"):
+            value=values.get(field)
+            if value is None or value=="": continue
+            current_source=record.data_sources.get(field,"")
+            if getattr(record,field) is not None and not current_source.startswith("mftool"): continue
+            setattr(record,field,value); record.data_sources[field]="Kaggle / mutual_fund_data.csv"
+        if values.get("amc") and (not record.amc or record.amc=="Unknown"): record.amc=values["amc"]; record.data_sources["amc"]="Kaggle / mutual_fund_data.csv"
+        if values.get("category") and (not record.category or record.category=="Other"): record.category=values["category"]; record.data_sources["category"]="Kaggle / mutual_fund_data.csv"
         if values.get("scheme_nav_name"):
-            nav_name = values["scheme_nav_name"]
-            lower = nav_name.lower()
-            if "direct" in lower:
-                record.plan_type = "Direct Growth" if "growth" in lower else "Direct"
-            elif "regular" in lower:
-                record.plan_type = "Regular Growth" if "growth" in lower else "Regular"
-        record.source_quality = max(record.source_quality, KAGGLE_NAV_SOURCE_QUALITY)
+            lower=values["scheme_nav_name"].lower()
+            if "direct" in lower: record.plan_type="Direct Growth" if "growth" in lower else "Direct"
+            elif "regular" in lower: record.plan_type="Regular Growth" if "growth" in lower else "Regular"
+        record.source_quality=max(record.source_quality,KAGGLE_NAV_SOURCE_QUALITY)
 
 
 def _load_kaggle_histories(settings: Settings, records: list[FundRecord]) -> dict[str, pd.DataFrame]:
@@ -1175,6 +1018,7 @@ def _load_mftool_performance(mf: Mftool, settings: Settings, records: list[FundR
 
     return by_name
 
+
 def _enrich_from_mftool_performance(records: list[FundRecord], performance: dict[str, dict]) -> None:
     """Fill direct-plan returns and benchmark from mftool's AMFI performance reports."""
     matched = 0
@@ -1261,8 +1105,6 @@ def _write_cache(path: Path, payload) -> None:
         tmp.replace(path)
     except Exception as exc:
         logger.debug("Could not cache mfdata response: %s", exc)
-
-
 def _mfdata_get(session: requests.Session, settings: Settings, path: str, params: dict | None = None):
     url = f"{MFDATA_BASE_URL}{path}"
     cache = _cache_path(settings, url, params)
@@ -1415,8 +1257,6 @@ def _extract_risk_detail(data: dict) -> dict:
 def _detail_from_payload(payload) -> dict | None:
     data = _payload_data(payload)
     return data if isinstance(data, dict) else None
-
-
 def _record_mfdata_detail(record: FundRecord, detail: dict) -> None:
     """Merge one mfdata scheme response without replacing stronger existing metrics."""
     record.source_quality = max(record.source_quality, 0.90)
@@ -1478,13 +1318,7 @@ def _fetch_family_holdings(settings: Settings, family_id: str):
 
 
 def _enrich_from_mfdata(settings: Settings, records: list[FundRecord], holdings: dict[str, Holding]) -> None:
-    """Enrich selected funds from mfdata with bulk-first, per-scheme fallback.
-
-    Bulk enrichment is an optimization, not a dependency. If the bulk endpoint
-    times out, each selected scheme is fetched independently. Family holdings are
-    fetched once per unique family_id and provide holdings, sectors and market-cap
-    weights. Scheme-level responses provide AUM, returns, ratios and valuation.
-    """
+    """Enrich selected funds from mfdata with bulk-first, per-scheme fallback."""
     if not records:
         return
 
@@ -1492,10 +1326,8 @@ def _enrich_from_mfdata(settings: Settings, records: list[FundRecord], holdings:
     codes = [str(r.scheme_code) for r in records if r.scheme_code]
     details_by_code: dict[str, dict] = {}
 
-    # Bulk is the only safe discovery path for this optional provider. If the
-    # bulk endpoint times out, do not fan out into many 15-second individual
-    # requests. That turns one provider outage into a multi-minute analysis
-    # stall and still rarely yields complete portfolio enrichment.
+    # Bulk is an optimization only. A timeout/HTTP failure leaves details_by_code
+    # incomplete and the independent scheme requests below become the fallback.
     bulk_failed = False
     for start in range(0, len(codes), MFDATA_BULK_CHUNK_SIZE):
         chunk = codes[start:start + MFDATA_BULK_CHUNK_SIZE]
@@ -1518,37 +1350,31 @@ def _enrich_from_mfdata(settings: Settings, records: list[FundRecord], holdings:
                     details_by_code[code] = item
 
     if bulk_failed:
-        logger.warning(
-            "mfdata bulk enrichment unavailable; skipping individual scheme fallback "
-            "for this run to avoid blocking analysis."
+        logger.warning("mfdata bulk enrichment unavailable; falling back to individual scheme requests for this run.")
+
+    missing = [r for r in records if r.scheme_code and str(r.scheme_code) not in details_by_code]
+    if missing:
+        logger.info(
+            "mfdata individual fallback: %d/%d schemes missing after bulk; fetching up to %d independently with %d workers.",
+            len(missing), len(records), MFDATA_INDIVIDUAL_FALLBACK_LIMIT, MFDATA_MAX_WORKERS,
         )
-    else:
-        missing = [r for r in records if r.scheme_code and str(r.scheme_code) not in details_by_code]
-        if missing:
-            logger.info(
-                "mfdata individual fallback: %d/%d schemes missing after successful bulk; "
-                "fetching up to %d independently with %d workers.",
-                len(missing), len(records), MFDATA_INDIVIDUAL_FALLBACK_LIMIT, MFDATA_MAX_WORKERS,
-            )
-            fallback_limit = min(len(missing), MFDATA_INDIVIDUAL_FALLBACK_LIMIT)
-            if fallback_limit:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=min(MFDATA_MAX_WORKERS, fallback_limit)) as pool:
-                    futures = [pool.submit(_fetch_mfdata_detail, settings, record) for record in missing[:fallback_limit]]
-                    for future in concurrent.futures.as_completed(futures):
-                        try:
-                            code, detail = future.result()
-                            if detail:
-                                details_by_code[str(code)] = detail
-                        except Exception as exc:
-                            logger.warning("mfdata individual scheme enrichment failed: %s", exc)
+        fallback_limit = min(len(missing), MFDATA_INDIVIDUAL_FALLBACK_LIMIT)
+        if fallback_limit:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(MFDATA_MAX_WORKERS, fallback_limit)) as pool:
+                futures = [pool.submit(_fetch_mfdata_detail, settings, record) for record in missing[:fallback_limit]]
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        code, detail = future.result()
+                        if detail:
+                            details_by_code[str(code)] = detail
+                    except Exception as exc:
+                        logger.warning("mfdata individual scheme enrichment failed: %s", exc)
 
     for record in records:
         detail = details_by_code.get(str(record.scheme_code))
         if detail:
             _record_mfdata_detail(record, detail)
 
-    # Fetch portfolio data once per unique family. Family-level storage means
-    # direct/regular variants share the same underlying holdings.
     family_to_records: dict[str, list[FundRecord]] = {}
     for record in records:
         family_id = getattr(record, "_mfdata_family_id", None)
@@ -1558,11 +1384,8 @@ def _enrich_from_mfdata(settings: Settings, records: list[FundRecord], holdings:
     held_lower = {name.lower() for name in holdings}
     ordered_families = sorted(
         family_to_records,
-        key=lambda fid: min(
-            0 if r.scheme_name.lower() in held_lower else 1 for r in family_to_records[fid]
-        ),
-    )
-    ordered_families = ordered_families[:MFDATA_FAMILY_ENRICHMENT_LIMIT]
+        key=lambda fid: min(0 if r.scheme_name.lower() in held_lower else 1 for r in family_to_records[fid]),
+    )[:MFDATA_FAMILY_ENRICHMENT_LIMIT]
 
     if ordered_families:
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(MFDATA_MAX_WORKERS, len(ordered_families))) as pool:
@@ -1593,6 +1416,79 @@ def _enrich_from_mfdata(settings: Settings, records: list[FundRecord], holdings:
         "mfdata enrichment completed: scheme_details=%d/%d holdings=%d/%d valuation=%d/%d",
         enriched_count, len(records), portfolio_count, len(records), valuation_count, len(records),
     )
+
+def _enrich_from_mfapi(settings: Settings, records: list[FundRecord]) -> None:
+    """Fill remaining NAV-derived gaps from MFapi.in using AMFI scheme codes."""
+    if not records:
+        return
+    if not MFAPI_ENABLED:
+        logger.info("MFapi NAV enrichment disabled by MFAPI_ENABLED=false.")
+        return
+
+    candidates = [
+        record for record in records
+        if record.scheme_code and any(
+            getattr(record, field) is None
+            for field in (
+                "latest_nav", "nav_date", "cagr_1y_pct", "cagr_3y_pct", "cagr_5y_pct",
+                "volatility_pct", "max_drawdown_pct", "sharpe", "sortino",
+            )
+        )
+    ]
+    if not candidates:
+        logger.info("MFapi NAV enrichment: no missing NAV-derived fields.")
+        return
+
+    histories = fetch_histories(
+        [str(record.scheme_code) for record in candidates],
+        settings.market_cache_dir,
+    )
+    enriched = 0
+    for record in candidates:
+        result = histories.get(str(record.scheme_code))
+        if not result:
+            continue
+        history, metadata = result
+        if history.empty:
+            continue
+        metrics = _calculate_nav_metrics(history)
+        meta = scheme_metadata(metadata)
+        changed = False
+
+        for field in (
+            "latest_nav", "cagr_1y_pct", "cagr_3y_pct", "cagr_5y_pct",
+            "volatility_pct", "max_drawdown_pct", "sharpe", "sortino",
+        ):
+            value = metrics.get(field)
+            if value is not None and getattr(record, field) is None:
+                setattr(record, field, value)
+                record.data_sources[field] = "MFapi.in NAV history"
+                changed = True
+
+        if metrics.get("nav_date") and record.nav_date is None:
+            record.nav_date = metrics["nav_date"]
+            record.data_sources["nav_date"] = "MFapi.in NAV history"
+            changed = True
+
+        if meta.get("fund_house") and (not record.amc or record.amc == "Unknown"):
+            record.amc = str(meta["fund_house"])
+            record.data_sources["amc"] = "MFapi.in scheme metadata"
+            changed = True
+        if meta.get("scheme_category") and (not record.category or record.category == "Other"):
+            record.category = str(meta["scheme_category"])
+            record.data_sources["category"] = "MFapi.in scheme metadata"
+            changed = True
+
+        record.nav_history_observations = max(
+            record.nav_history_observations or 0,
+            int(metrics.get("nav_history_observations") or 0),
+        )
+        if changed:
+            record.source_quality = max(record.source_quality, 0.97)
+            enriched += 1
+
+    logger.info("MFapi NAV enrichment completed: enriched=%d/%d candidates.", enriched, len(candidates))
+
 
 def _fund_record(mf: Mftool, item: dict, holdings: dict[str, Holding]) -> FundRecord:
     name = item["scheme_name"]
@@ -1653,7 +1549,6 @@ def _fund_record(mf: Mftool, item: dict, holdings: dict[str, Holding]) -> FundRe
         data_sources=sources,
         nav_history_observations=hist.get("nav_history_observations"),
     )
-
 
 def fetch_universe(settings: Settings, mf: Mftool) -> list[dict]:
     """Deterministic universe. Never randomize the candidate set."""
@@ -1755,6 +1650,14 @@ def build_fund_universe(settings: Settings, holdings: dict[str, Holding]) -> lis
     except Exception as exc:
         logger.warning("mftool performance enrichment failed: %s", exc)
 
+    # MFapi is a bounded, scheme-code-based NAV-history fallback. It runs before
+    # the opt-in Kaggle archive because it is a live API and requires no dataset
+    # download or credentials.
+    try:
+        _enrich_from_mfapi(settings, records)
+    except Exception as exc:
+        logger.warning("MFapi NAV enrichment failed; continuing with existing data: %s", exc)
+
     # Kaggle is intentionally outside the normal analysis path. The previous
     # implementation could spend minutes scanning the large historical parquet
     # even when the primary AMFI-derived provider was already available. Keep
@@ -1773,7 +1676,7 @@ def build_fund_universe(settings: Settings, holdings: dict[str, Holding]) -> lis
         logger.info("mfdata optional enrichment starting for %d funds.", len(records))
         _enrich_from_mfdata(settings, records, holdings)
     except Exception as exc:
-        logger.warning("mfdata enrichment failed; continuing with mftool/AMFI data: %s", exc)
+        logger.warning("mfdata enrichment failed; continuing with mftool/AMFI/MFapi data: %s", exc)
     finally:
         logger.info("mfdata optional enrichment finished.")
 
