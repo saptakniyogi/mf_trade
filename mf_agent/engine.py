@@ -14,6 +14,7 @@ from .portfolio import (
     existing_exposure,
     holding_for_fund,
     investment_option_status,
+    sip_allocation_for_candidates,
 )
 from .ranking import diversify_shortlist, rank_candidates
 from .regime import infer_regime
@@ -21,6 +22,36 @@ from .scenarios import scenario_matrix
 from .scoring import score_fund
 
 logger = logging.getLogger("mf_agent")
+
+
+def _trim_reason(score) -> str | None:
+    """Return explicit deterministic evidence required before recommending TRIM."""
+    if score.fund_quality < 40.0:
+        return (
+            f"Fund quality score {score.fund_quality:.2f} is below the "
+            "40.0 trim threshold."
+        )
+    if score.risk_adjusted_return is not None and score.risk_adjusted_return < 35.0:
+        return (
+            f"Risk-adjusted return score {score.risk_adjusted_return:.2f} is below "
+            "the 35.0 trim threshold."
+        )
+    if score.valuation is not None and score.valuation < 30.0:
+        return (
+            f"Valuation score {score.valuation:.2f} indicates a materially weak "
+            "valuation signal."
+        )
+    if score.portfolio_fit is not None and score.portfolio_fit < 55.0:
+        return (
+            f"Portfolio-fit score {score.portfolio_fit:.2f} indicates excessive "
+            "overlap or concentration."
+        )
+    if score.macro_resilience < 45.0:
+        return (
+            f"Macro resilience {score.macro_resilience:.2f} is below the "
+            "45.0 defensive threshold."
+        )
+    return None
 
 
 class ResearchEngine:
@@ -98,6 +129,21 @@ class ResearchEngine:
             for item in allocations
         }
 
+        sip_candidates = [
+            (fund, score)
+            for fund, score in scored
+            if score.allocation_eligible
+            and score.evidence_status == "ELIGIBLE"
+        ]
+        sip_recommendations = sip_allocation_for_candidates(
+            sip_candidates,
+            holdings,
+            funds,
+            self.settings.sip_monthly_amount,
+            self.settings.policy,
+            self.settings.allocation_mode,
+        )
+
         evaluated = []
 
         for fund, score in sorted(
@@ -119,6 +165,7 @@ class ResearchEngine:
             # cannot be mapped to a canonical AMFI scheme. Missing identity is a
             # data-quality problem, not evidence that the investor should trim.
             action = "HOLD" if is_holding else "WAIT"
+            trim_reason = None
 
             if fund.scheme_name in allocation_map:
                 action = allocation_map[fund.scheme_name]["action"]
@@ -129,7 +176,12 @@ class ResearchEngine:
                 and score.evidence_status == "ELIGIBLE"
                 and score.overall < 45
             ):
-                action = "TRIM"
+                trim_reason = _trim_reason(score)
+                if trim_reason:
+                    action = "TRIM"
+
+            if trim_reason and trim_reason not in score.reasons_not_to_buy:
+                score.reasons_not_to_buy.append(trim_reason)
 
             evaluated.append(
                 {
@@ -137,6 +189,7 @@ class ResearchEngine:
                     "category": fund.category,
                     "amc": fund.amc,
                     "action": action,
+                    "trim_reason": trim_reason,
                     "score": score.to_dict(),
                     "fund_metrics": fund.to_dict(),
                     "portfolio_performance": (
@@ -244,7 +297,7 @@ class ResearchEngine:
         )
 
         return {
-            "engine_version": "2.5.2",
+            "engine_version": "2.6.0",
             "settings": {
                 "horizon": asdict(self.settings.horizon),
                 "investment_amount": float(
@@ -331,5 +384,5 @@ class ResearchEngine:
                 },
             },
             "allocation_plan": allocations,
-            "sip_recommendations": [],
+            "sip_recommendations": sip_recommendations,
         }

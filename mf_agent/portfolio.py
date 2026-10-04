@@ -9,6 +9,7 @@ from .models import FundRecord, Holding, FundScore
 # Deterministic quality threshold used by both investment routes. A fund can be
 # evidence-qualified yet still be below the score required for a fresh action.
 ROUTE_RECOMMENDATION_SCORE = 50.0
+ROUTE_MACRO_MINIMUM = 45.0
 
 
 def normalize_scheme_identity(name: str) -> str:
@@ -134,6 +135,9 @@ def _eligible_candidates(
             continue
 
         if score.ranking_score < ROUTE_RECOMMENDATION_SCORE:
+            continue
+
+        if score.macro_resilience < ROUTE_MACRO_MINIMUM:
             continue
 
         if _candidate_capacity(fund, category, amc, policy) <= 0:
@@ -368,6 +372,118 @@ def allocation_for_candidates(
 
 
 
+def sip_allocation_for_candidates(
+    candidates: list[tuple[FundRecord, FundScore]],
+    holdings: dict[str, Holding],
+    funds: list[FundRecord],
+    monthly_amount: float,
+    policy: PortfolioPolicy,
+    mode: str = "DIVERSIFIED",
+) -> list[dict]:
+    """Build a deterministic monthly SIP plan independently of one-time cash.
+
+    The SIP route uses the same evidence, score, macro and portfolio-capacity
+    gates as fresh capital allocation, but the monthly SIP budget is completely
+    separate from ``deployable_cash``.
+    """
+    monthly_amount = max(0.0, float(monthly_amount or 0.0))
+    exposure = existing_exposure(holdings, funds)
+    category = defaultdict(float, exposure["category_weights"])
+    amc = defaultdict(float, exposure["amc_weights"])
+
+    eligible = _eligible_candidates(
+        candidates,
+        category,
+        amc,
+        policy,
+    )
+
+    if not eligible:
+        return []
+
+    if str(mode or "DIVERSIFIED").upper() == "CONCENTRATED":
+        eligible = eligible[: max(1, int(policy.max_concentrated_funds))]
+
+    strengths = {
+        fund.scheme_name: max(1.0, score.ranking_score - ROUTE_RECOMMENDATION_SCORE)
+        for fund, score in eligible
+    }
+    total_strength = sum(strengths.values()) or float(len(eligible))
+
+    rows = []
+    for fund, score in eligible:
+        capacity_pct = _candidate_capacity(fund, category, amc, policy)
+        if capacity_pct <= 0:
+            continue
+
+        target_pct = strengths[fund.scheme_name] / total_strength * 100.0
+        max_monthly = (
+            exposure["total_value"] * capacity_pct / 100.0
+            if exposure["total_value"] > 0
+            else float("inf")
+        )
+        recommended_monthly = (
+            min(monthly_amount * target_pct / 100.0, max_monthly)
+            if monthly_amount > 0
+            else 0.0
+        )
+
+        rows.append({
+            "scheme_name": fund.scheme_name,
+            "category": fund.category,
+            "amc": fund.amc,
+            "action": (
+                "ACCUMULATE"
+                if holding_for_fund(fund, holdings) is not None
+                else "BUY"
+            ),
+            "score": score.overall,
+            "ranking_score": score.ranking_score,
+            "data_confidence": score.data_confidence,
+            "evidence_status": score.evidence_status,
+            "portfolio_capacity_pct": round(capacity_pct, 2),
+            "target_sip_pct": round(target_pct, 2),
+            "monthly_amount": round(recommended_monthly, 2),
+            "max_monthly_amount": (
+                round(max_monthly, 2)
+                if max_monthly != float("inf")
+                else None
+            ),
+            "reason": (
+                "Deterministic SIP candidate: passes evidence, score, macro and portfolio-capacity gates."
+            ),
+        })
+
+    if monthly_amount <= 0:
+        return rows
+
+    # Re-normalize after capacity caps so the displayed SIP plan uses the
+    # requested monthly budget whenever portfolio capacity permits it.
+    remaining = monthly_amount
+    for row in sorted(rows, key=lambda x: x["ranking_score"], reverse=True):
+        if remaining <= 0:
+            row["monthly_amount"] = 0.0
+            continue
+        desired = min(
+            monthly_amount * row["target_sip_pct"] / 100.0,
+            row["max_monthly_amount"]
+            if row["max_monthly_amount"] is not None
+            else monthly_amount,
+        )
+        amount = min(max(0.0, desired), remaining)
+        row["monthly_amount"] = round(amount, 2)
+        row["allocation_pct_of_monthly_sip"] = round(
+            amount / monthly_amount * 100.0,
+            2,
+        )
+        remaining -= amount
+
+    for row in rows:
+        row.setdefault("allocation_pct_of_monthly_sip", 0.0)
+
+    return rows
+
+
 def investment_option_status(
     fund: FundRecord,
     score: FundScore,
@@ -411,6 +527,27 @@ def investment_option_status(
                 "reason": reason,
             },
             "portfolio_capacity_pct": round(capacity, 2),
+        }
+
+    if score.macro_resilience < ROUTE_MACRO_MINIMUM:
+        reason = (
+            f"Macro resilience {score.macro_resilience:.2f} is below the "
+            f"{ROUTE_MACRO_MINIMUM:.1f} fresh-investment threshold for the current regime."
+        )
+        return {
+            "one_time": {
+                "eligible": False,
+                "recommended": False,
+                "status": "BLOCKED",
+                "reason": reason,
+            },
+            "sip": {
+                "eligible": False,
+                "recommended": False,
+                "status": "BLOCKED",
+                "reason": reason,
+            },
+            "portfolio_capacity_pct": round(max(0.0, capacity), 2),
         }
 
     if capacity <= 0:

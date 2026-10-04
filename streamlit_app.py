@@ -81,6 +81,9 @@ def current_investor_inputs():
             "LONG_TERM",
         ),
         "allocation_mode": allocation_mode,
+        "sip_monthly_amount": float(
+            st.session_state.get("sip_monthly_amount", 0.0)
+        ),
     }
 
 
@@ -292,6 +295,9 @@ def apply_env_from_sidebar():
     os.environ["MF_INVESTMENT_AMOUNT"] = str(
         st.session_state.investment_amount
     )
+    os.environ["MF_SIP_MONTHLY_AMOUNT"] = str(
+        st.session_state.sip_monthly_amount
+    )
     os.environ["INVESTOR_AGE"] = str(
         st.session_state.investor_age
     )
@@ -490,6 +496,22 @@ with st.sidebar:
         help=(
             "New money available for this analysis. "
             "This is separate from existing holdings."
+        ),
+    )
+
+    st.number_input(
+        "Monthly SIP amount (₹)",
+        min_value=0.0,
+        value=float(
+            os.getenv(
+                "MF_SIP_MONTHLY_AMOUNT",
+                0,
+            )
+        ),
+        step=1000.0,
+        key="sip_monthly_amount",
+        help=(
+            "Monthly amount available for SIP. This is independent of the one-time investment amount."
         ),
     )
 
@@ -908,6 +930,7 @@ regime = market.get("regime", {})
 portfolio = result.get("portfolio", {})
 funds = result.get("evaluated_funds", [])
 allocation = result.get("allocation_plan", [])
+sip_recommendations = result.get("sip_recommendations", [])
 metadata = result.get("metadata", {})
 
 
@@ -985,6 +1008,16 @@ profile_cols[3].metric(
     current_investor_inputs()["allocation_mode"],
 )
 
+sip_profile_cols = st.columns(2)
+sip_profile_cols[0].metric(
+    "Monthly SIP",
+    money(current_investor_inputs()["sip_monthly_amount"]),
+)
+sip_profile_cols[1].metric(
+    "SIP candidates",
+    len(result.get("sip_recommendations", [])),
+)
+
 if mark_result_stale():
     st.info(
         "The investor profile shown above reflects your current dashboard "
@@ -1006,6 +1039,7 @@ st.divider()
     tab_macro,
     tab_scenarios,
     tab_news,
+    tab_sip,
     tab_diag,
     tab_raw,
 ) = st.tabs(
@@ -1016,6 +1050,7 @@ st.divider()
         "Macro & Regime",
         "Scenarios",
         "News",
+        "SIP Planner",
         "Diagnostics",
         "Raw JSON",
     ]
@@ -1122,11 +1157,6 @@ with tab_overview:
             reason = item.get("reason") or "Selected by the quantitative allocation engine."
             if len(reason) > 240:
                 reason = reason[:237] + "..."
-            raw_score = item.get("score")
-            if isinstance(raw_score, dict):
-                display_score = raw_score.get("ranking_score", raw_score.get("overall"))
-            else:
-                display_score = raw_score
             allocation_rows.append({
                 "Fund": item.get("scheme_name"),
                 "Category": item.get("category"),
@@ -1134,7 +1164,7 @@ with tab_overview:
                 "Action": item.get("final_action", item.get("action")),
                 "Allocation %": item.get("allocation_pct_of_new_cash"),
                 "Capital": money(item.get("capital_required")),
-                "Score": display_score,
+                "Score": item.get("score"),
                 "Data confidence": item.get("data_confidence"),
                 "Reason": reason,
                 "Data gaps": len(warnings),
@@ -1394,23 +1424,6 @@ with tab_funds:
                 st.write("**LLM challenge review**")
                 st.json(review)
 
-        data_sources = metrics.get("data_sources") or {}
-        nav_observations = metrics.get("nav_history_observations")
-        if data_sources or nav_observations:
-            with st.expander("Data sources", expanded=False):
-                if nav_observations:
-                    st.caption(f"Historical NAV observations: {nav_observations}")
-                source_rows = [
-                    {"Metric": metric, "Source": source}
-                    for metric, source in sorted(data_sources.items())
-                ]
-                if source_rows:
-                    st.dataframe(
-                        pd.DataFrame(source_rows),
-                        hide_index=True,
-                        use_container_width=True,
-                    )
-
 
 # ---------------------------------------------------------------------------
 # Portfolio
@@ -1637,34 +1650,18 @@ with tab_macro:
         ),
     }
 
-    macro_sources = macro.get("macro_sources") or {}
-    source_keys = {
-        "USD/INR": "usd_inr",
-        "Brent crude": "brent_crude_usd",
-        "India VIX": "india_vix",
-        "India 10Y yield": "india_10y_yield_pct",
-        "Nifty 50": "nifty_50",
-        "Nifty Midcap": "nifty_midcap",
-        "Nifty Smallcap": "nifty_smallcap",
-        "Gold": "gold_usd",
-        "US 10Y yield": "us_10y_yield_pct",
-        "S&P 500": "sp500",
-        "Crude 1M change": "crude_change_1m_pct",
-        "USD/INR 1M change": "usd_inr_change_1m_pct",
-        "VIX 1M change": "india_vix_change_1m_pct",
-        "Inflation": "inflation_pct",
-        "Repo rate": "repo_rate_pct",
-    }
+    macro_sources = macro.get("macro_sources", {})
     macro_rows_display = []
     for key, value in macro_rows.items():
-        source_key = source_keys[key]
-        source = macro_sources.get(source_key)
-        if source in (None, "", "Unavailable", "No source") and value is not None:
-            source = "Yahoo Finance" if source_key not in {"india_10y_yield_pct", "inflation_pct", "repo_rate_pct"} else "RBI DBIE"
+        source_key = {
+            "India 10Y yield": "india_10y_yield_pct",
+            "Inflation": "inflation_pct",
+            "Repo rate": "repo_rate_pct",
+        }.get(key)
         macro_rows_display.append({
             "Indicator": key,
             "Value": value if value is not None else "Unavailable",
-            "Source": source or "Unavailable",
+            "Source": macro_sources.get(source_key, "Yahoo Finance" if value is not None else "No source"),
         })
 
     st.dataframe(
@@ -1813,6 +1810,126 @@ with tab_news:
         st.info(
             "No news events were returned."
         )
+
+
+# ---------------------------------------------------------------------------
+# SIP Planner
+# ---------------------------------------------------------------------------
+
+with tab_sip:
+    st.subheader("Monthly SIP planner")
+
+    sip_amount = st.number_input(
+        "Monthly SIP amount (₹)",
+        min_value=0.0,
+        value=float(
+            current_investor_inputs().get("sip_monthly_amount", 0.0)
+        ),
+        step=1000.0,
+        key="sip_planner_amount",
+        help="This budget is independent of the one-time investment amount.",
+    )
+
+    if sip_amount != current_investor_inputs().get("sip_monthly_amount", 0.0):
+        st.info(
+            "The planner amount differs from the last engine run. "
+            "Update the Monthly SIP amount in the sidebar and run analysis "
+            "to regenerate the deterministic SIP plan."
+        )
+
+    st.caption(
+        "SIP recommendations are evaluated independently from the one-time allocation. "
+        "Portfolio capacity, evidence, score and macro gates still apply."
+    )
+
+    if not sip_recommendations:
+        st.warning(
+            "No SIP funds are currently recommended. "
+            "Run the analysis with a non-zero Monthly SIP amount, or check the "
+            "Fund Research tab for blocked SIP routes."
+        )
+    else:
+        sip_rows = []
+        for item in sip_recommendations:
+            sip_rows.append({
+                "Fund": item.get("scheme_name"),
+                "Category": item.get("category"),
+                "AMC": item.get("amc"),
+                "Action": item.get("action"),
+                "Score": item.get("ranking_score", item.get("score")),
+                "Data confidence": item.get("data_confidence"),
+                "Portfolio capacity %": item.get("portfolio_capacity_pct"),
+                "Target SIP %": item.get("target_sip_pct"),
+                "Monthly SIP": money(item.get("monthly_amount")),
+                "Max monthly": money(item.get("max_monthly_amount")),
+            })
+
+        sip_df = pd.DataFrame(sip_rows)
+        st.dataframe(
+            sip_df,
+            hide_index=True,
+            use_container_width=True,
+        )
+
+        allocated_sip = sum(
+            float(item.get("monthly_amount") or 0.0)
+            for item in sip_recommendations
+        )
+        unallocated_sip = max(0.0, sip_amount - allocated_sip)
+
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Requested monthly SIP", money(sip_amount))
+        k2.metric("Recommended monthly SIP", money(allocated_sip))
+        k3.metric("Unallocated monthly SIP", money(unallocated_sip))
+
+        if unallocated_sip > 0.01:
+            st.warning(
+                f"{money(unallocated_sip)} per month remains unallocated because "
+                "eligible funds are constrained by portfolio capacity or the deterministic gates."
+            )
+        else:
+            st.success("The full requested monthly SIP is allocated across the recommended funds.")
+
+        st.subheader("Fund-level SIP recommendations")
+        for item in sip_recommendations:
+            amount = float(item.get("monthly_amount") or 0.0)
+            with st.expander(
+                f"{item.get('scheme_name')} · {money(amount)}/month",
+                expanded=False,
+            ):
+                st.write("**Action:**", item.get("action", "—"))
+                st.write("**Reason:**", item.get("reason", "—"))
+                st.write("**Portfolio capacity:**", pct(item.get("portfolio_capacity_pct")))
+                st.write("**Target SIP allocation:**", pct(item.get("target_sip_pct")))
+                st.write("**Maximum monthly amount:**", money(item.get("max_monthly_amount")))
+
+    st.divider()
+    st.subheader("SIP availability across evaluated funds")
+
+    availability_rows = []
+    for fund in funds:
+        options = fund.get("investment_options") or {}
+        sip = options.get("sip") or {}
+        if sip.get("eligible") or sip.get("status") in {"AVAILABLE", "BLOCKED"}:
+            availability_rows.append({
+                "Fund": fund.get("scheme_name"),
+                "Category": fund.get("category"),
+                "Action": fund.get("action", fund.get("final_action")),
+                "SIP status": sip.get("status"),
+                "Recommended": "Yes" if sip.get("recommended") else "No",
+                "Reason": sip.get("reason"),
+                "Capacity %": options.get("portfolio_capacity_pct"),
+            })
+
+    if availability_rows:
+        st.dataframe(
+            pd.DataFrame(availability_rows),
+            hide_index=True,
+            use_container_width=True,
+            height=420,
+        )
+    else:
+        st.info("No SIP route information is present in this analysis result. Run the 2.6.0 engine first.")
 
 
 # ---------------------------------------------------------------------------

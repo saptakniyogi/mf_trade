@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any
 
 
-ENGINE_VERSION = "2.5.2"
+ENGINE_VERSION = "2.6.0"
 RANKING_EVIDENCE_CAP = 49.99
 EPSILON = 1e-6
 PERCENT_EPSILON = 1e-4
@@ -884,6 +884,73 @@ def _check_allocations(data: dict[str, Any]) -> CheckResult:
     return result
 
 
+def _check_sip_recommendations(data: dict[str, Any]) -> CheckResult:
+    result = CheckResult("SIP allocation plan")
+    recommendations = data.get("sip_recommendations")
+    settings = data.get("settings") or {}
+    monthly_amount = settings.get("sip_monthly_amount", 0.0)
+
+    if not isinstance(recommendations, list):
+        result.fail("sip_recommendations must be a list.")
+        return result
+    if not _finite_number(monthly_amount) or float(monthly_amount) < 0:
+        result.fail("settings.sip_monthly_amount must be a non-negative number.")
+        return result
+
+    total_amount = 0.0
+    total_pct = 0.0
+    seen: set[str] = set()
+
+    for index, item in enumerate(recommendations):
+        if not isinstance(item, dict):
+            result.fail(f"sip_recommendations[{index}] is not an object.")
+            continue
+        name = str(item.get("scheme_name") or "")
+        if not name:
+            result.fail(f"sip_recommendations[{index}] has no scheme_name.")
+            continue
+        if name in seen:
+            result.fail(f"Duplicate SIP recommendation for {name}.")
+        seen.add(name)
+
+        if item.get("evidence_status") != "ELIGIBLE":
+            result.fail(f"{name}: SIP recommendation is not evidence-qualified.")
+        if item.get("action") not in {"BUY", "ACCUMULATE"}:
+            result.fail(f"{name}: invalid SIP action={item.get('action')!r}.")
+
+        for key in ("ranking_score", "target_sip_pct", "portfolio_capacity_pct"):
+            if not _finite_number(item.get(key)):
+                result.fail(f"{name}: SIP field {key} is missing/invalid.")
+
+        amount = item.get("monthly_amount", 0.0)
+        pct = item.get("allocation_pct_of_monthly_sip", 0.0)
+        if not _finite_number(amount) or float(amount) < -EPSILON:
+            result.fail(f"{name}: monthly_amount is invalid.")
+        if not _finite_number(pct) or float(pct) < -PERCENT_EPSILON:
+            result.fail(f"{name}: allocation_pct_of_monthly_sip is invalid.")
+
+        if float(monthly_amount) > 0:
+            expected = float(monthly_amount) * float(pct) / 100.0
+            if not _close(float(amount), expected, tolerance=0.01):
+                result.fail(
+                    f"{name}: monthly_amount={amount} does not match "
+                    f"monthly SIP × allocation percentage ({expected:.2f})."
+                )
+
+        total_amount += max(0.0, float(amount))
+        total_pct += max(0.0, float(pct))
+
+    if total_pct > 100.0 + PERCENT_EPSILON:
+        result.fail(f"SIP allocation percentages total {total_pct:.4f}% > 100%.")
+    if float(monthly_amount) > 0 and total_amount > float(monthly_amount) + 0.01:
+        result.fail(
+            f"SIP monthly allocation ₹{total_amount:.2f} exceeds configured "
+            f"monthly SIP ₹{float(monthly_amount):.2f}."
+        )
+
+    return result
+
+
 def audit(data: dict[str, Any], input_file: str = "<memory>") -> AuditResult:
     funds = data.get("evaluated_funds")
     fund_count = len(funds) if isinstance(funds, list) else 0
@@ -898,6 +965,7 @@ def audit(data: dict[str, Any], input_file: str = "<memory>") -> AuditResult:
         _check_portfolio_safety(data, holding_names),
         _check_portfolio_identity(data),
         _check_allocations(data),
+        _check_sip_recommendations(data),
     ]
 
     return AuditResult(
@@ -939,6 +1007,7 @@ def print_report(result: AuditResult, strict: bool = False) -> None:
     print(f"Portfolio safety violations:  {len(result.checks[5].failures)}")
     print(f"Portfolio identity failures:    {len(result.checks[6].failures)}")
     print(f"Allocation calculation errors: {len(result.checks[7].failures)}")
+    print(f"SIP allocation errors:          {len(result.checks[8].failures)}")
     print(f"Warnings:                      {result.warning_count}")
     print()
 
