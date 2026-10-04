@@ -6,6 +6,11 @@ from .config import PortfolioPolicy
 from .models import FundRecord, Holding, FundScore
 
 
+# Deterministic quality threshold used by both investment routes. A fund can be
+# evidence-qualified yet still be below the score required for a fresh action.
+ROUTE_RECOMMENDATION_SCORE = 50.0
+
+
 def existing_exposure(
     holdings: dict[str, Holding],
     funds: list[FundRecord],
@@ -85,7 +90,7 @@ def _eligible_candidates(
         if score.evidence_status != "ELIGIBLE":
             continue
 
-        if score.ranking_score < 50:
+        if score.ranking_score < ROUTE_RECOMMENDATION_SCORE:
             continue
 
         if _candidate_capacity(fund, category, amc, policy) <= 0:
@@ -332,9 +337,10 @@ def investment_option_status(
 ) -> dict:
     """Evaluate one-time and SIP routes independently.
 
-    One-time availability is tied to the current deployable-cash plan. SIP
-    availability is independent of today's deployable cash, but still obeys
-    the evidence and portfolio-capacity gates.
+    ``eligible`` answers whether a route is available. ``recommended`` answers
+    whether the deterministic engine considers that route strong enough to
+    recommend. This distinction prevents one-time cash allocation from hiding a
+    valid SIP route and makes the two decisions independently testable.
     """
     evidence_ok = score.allocation_eligible and score.evidence_status == "ELIGIBLE"
     investment_mode = str(investment_mode or "BOTH").upper()
@@ -344,47 +350,88 @@ def investment_option_status(
     category = defaultdict(float, exposure["category_weights"])
     amc = defaultdict(float, exposure["amc_weights"])
     capacity = _candidate_capacity(fund, category, amc, policy)
+    score_qualified = evidence_ok and score.ranking_score >= ROUTE_RECOMMENDATION_SCORE
 
     if not evidence_ok:
         reason = "Hard evidence gate is not satisfied."
         return {
-            "one_time": {"eligible": False, "status": "BLOCKED", "reason": reason},
-            "sip": {"eligible": False, "status": "BLOCKED", "reason": reason},
+            "one_time": {
+                "eligible": False,
+                "recommended": False,
+                "status": "BLOCKED",
+                "reason": reason,
+            },
+            "sip": {
+                "eligible": False,
+                "recommended": False,
+                "status": "BLOCKED",
+                "reason": reason,
+            },
             "portfolio_capacity_pct": round(capacity, 2),
         }
 
     if capacity <= 0:
         reason = "Portfolio category or AMC capacity is exhausted."
         return {
-            "one_time": {"eligible": False, "status": "BLOCKED", "reason": reason},
-            "sip": {"eligible": False, "status": "BLOCKED", "reason": reason},
+            "one_time": {
+                "eligible": False,
+                "recommended": False,
+                "status": "BLOCKED",
+                "reason": reason,
+            },
+            "sip": {
+                "eligible": False,
+                "recommended": False,
+                "status": "BLOCKED",
+                "reason": reason,
+            },
             "portfolio_capacity_pct": 0.0,
         }
 
+    one_time_available = bool(one_time_enabled and one_time_allocated)
+    sip_available = bool(sip_enabled)
+    one_time_recommended = bool(one_time_available and score_qualified)
+    sip_recommended = bool(sip_available and score_qualified)
+
+    if not score_qualified:
+        route_reason = (
+            f"Fund is evidence-qualified, but ranking score {score.ranking_score:.2f} "
+            f"is below the {ROUTE_RECOMMENDATION_SCORE:.1f} route recommendation threshold."
+        )
+    else:
+        route_reason = "Fund passes the deterministic evidence and score gates for this route."
+
     return {
         "one_time": {
-            "eligible": bool(one_time_enabled and one_time_allocated),
+            "eligible": one_time_available,
+            "recommended": one_time_recommended,
             "status": (
                 "AVAILABLE"
-                if one_time_enabled and one_time_allocated
+                if one_time_available
                 else "DISABLED" if not one_time_enabled else "NOT_ALLOCATED"
             ),
             "reason": (
-                "Fund is included in the current one-time deployable-cash plan."
-                if one_time_enabled and one_time_allocated
+                "Fund is included in the current one-time deployable-cash plan and passes the route score gate."
+                if one_time_recommended
+                else "Fund is included in the current one-time deployable-cash plan but does not pass the route score gate."
+                if one_time_available
                 else "One-time investment is disabled by MF_INVESTMENT_MODE."
                 if not one_time_enabled
                 else "Fund is evidence-qualified but was not selected by the current one-time cash allocator."
             ),
         },
         "sip": {
-            "eligible": sip_enabled,
-            "status": "AVAILABLE" if sip_enabled else "DISABLED",
+            "eligible": sip_available,
+            "recommended": sip_recommended,
+            "status": "AVAILABLE" if sip_available else "DISABLED",
             "reason": (
-                "Fund is evidence-qualified and has portfolio capacity; SIP can be evaluated independently of today's deployable cash."
-                if sip_enabled
+                "Fund passes the deterministic evidence and score gates; SIP can be evaluated independently of today's deployable cash."
+                if sip_recommended
+                else route_reason
+                if sip_available
                 else "SIP is disabled by MF_INVESTMENT_MODE."
             ),
         },
         "portfolio_capacity_pct": round(capacity, 2),
     }
+

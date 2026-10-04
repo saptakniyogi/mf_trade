@@ -104,17 +104,22 @@ class ResearchEngine:
             ),
             reverse=True,
         ):
-            action = (
-                "HOLD"
-                if fund.scheme_name in holdings
-                else "WAIT"
-            )
+            is_holding = fund.scheme_name in holdings
+            is_unresolved_holding = is_holding and not fund.scheme_code
+
+            # Never issue a position-changing recommendation when the holding
+            # cannot be mapped to a canonical AMFI scheme. Missing identity is a
+            # data-quality problem, not evidence that the investor should trim.
+            action = "HOLD" if is_holding else "WAIT"
 
             if fund.scheme_name in allocation_map:
                 action = allocation_map[fund.scheme_name]["action"]
             elif (
-                score.overall < 45
-                and fund.scheme_name in holdings
+                is_holding
+                and not is_unresolved_holding
+                and score.allocation_eligible
+                and score.evidence_status == "ELIGIBLE"
+                and score.overall < 45
             ):
                 action = "TRIM"
 
@@ -162,12 +167,28 @@ class ResearchEngine:
                 one_time_allocated=item["scheme_name"] in allocation_map,
                 investment_mode=self.settings.investment_mode,
             )
-            if item["scheme_name"] in allocation_map:
+            one_time_recommended = bool(
+                item["investment_options"].get("one_time", {}).get("recommended", False)
+            )
+            sip_recommended = bool(
+                item["investment_options"].get("sip", {}).get("recommended", False)
+            )
+
+            # Investment routes are independent. Do not let one-time allocation
+            # mask a valid SIP recommendation, or vice versa.
+            if one_time_recommended and sip_recommended:
+                item["quantitative_investment_mode"] = "BOTH"
+            elif one_time_recommended:
                 item["quantitative_investment_mode"] = "ONE_TIME"
-            elif item["investment_options"]["sip"]["eligible"]:
+            elif sip_recommended:
                 item["quantitative_investment_mode"] = "SIP"
             else:
                 item["quantitative_investment_mode"] = "NEITHER"
+
+            if not is_holding and (one_time_recommended or sip_recommended):
+                item["action"] = "BUY"
+            elif is_holding and not is_unresolved_holding and sip_recommended and item["action"] == "WAIT":
+                item["action"] = "ACCUMULATE"
 
         ranked_for_review = rank_candidates(
             evaluated,
@@ -206,7 +227,7 @@ class ResearchEngine:
         )
 
         return {
-            "engine_version": "2.4.0",
+            "engine_version": "2.5.0",
             "settings": {
                 "horizon": asdict(self.settings.horizon),
                 "investment_amount": float(

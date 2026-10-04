@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from importlib.metadata import PackageNotFoundError, version
@@ -1592,9 +1593,14 @@ def _fund_record(mf: Mftool, item: dict, holdings: dict[str, Holding]) -> FundRe
         nav_history_observations=hist.get("nav_history_observations"),
     )
 
-def fetch_universe(settings: Settings, mf: Mftool) -> list[dict]:
-    """Deterministic universe. Never randomize the candidate set."""
-    schemes = mf.get_scheme_codes()
+def fetch_universe(
+    settings: Settings,
+    mf: Mftool,
+    schemes: dict | None = None,
+) -> list[dict]:
+    """Build the deterministic research universe from the AMFI scheme map."""
+    if schemes is None:
+        schemes = mf.get_scheme_codes()
     candidates = []
     per_category: dict[str, int] = {}
     per_amc_category: dict[tuple[str, str], int] = {}
@@ -1634,16 +1640,106 @@ def load_optional_factsheet_data(settings: Settings, scheme_name: str) -> dict:
         return {}
 
 
+
+def _normalize_scheme_name(name: str) -> str:
+    """Normalize common AMFI/Zerodha plan-name differences for identity matching."""
+    value = str(name or "").upper()
+    value = re.sub(r"[^A-Z0-9]+", " ", value)
+    removable = {
+        "DIRECT", "REGULAR", "PLAN", "GROWTH", "IDCW", "DIVIDEND",
+        "PAYOUT", "REINVESTMENT", "REINVEST", "BONUS", "OPTION",
+    }
+    tokens = [token for token in value.split() if token not in removable]
+    return " ".join(tokens).strip()
+
+
+def _resolve_holding_scheme(
+    holding_name: str,
+    schemes: dict,
+) -> dict | None:
+    """Resolve a portfolio holding to a canonical AMFI scheme code when possible."""
+    target = _normalize_scheme_name(holding_name)
+    if not target:
+        return None
+
+    exact = []
+    for code, name in schemes.items():
+        normalized = _normalize_scheme_name(name)
+        if normalized == target:
+            exact.append((str(code), str(name)))
+
+    if len(exact) == 1:
+        code, canonical_name = exact[0]
+        return {
+            "scheme_name": canonical_name,
+            "category": classify_category(canonical_name),
+            "amc": "Unknown",
+            "code": code,
+        }
+
+    # A normalized holding name can occasionally map to multiple plan variants.
+    # Prefer the name that most closely preserves the original holding string.
+    if exact:
+        # Prefer Direct plans over Regular plans. The normalization intentionally
+        # removes plan/growth suffixes, so this tie-break is required to avoid
+        # mapping a direct portfolio holding to a regular scheme variant.
+        target_upper = str(holding_name or "").upper()
+        exact.sort(
+            key=lambda item: (
+                0 if "DIRECT" in item[1].upper() else 1,
+                0 if "GROWTH" in target_upper and "GROWTH" in item[1].upper() else 1,
+                abs(len(item[1]) - len(holding_name)),
+                item[1],
+            )
+        )
+        code, canonical_name = exact[0]
+        return {
+            "scheme_name": canonical_name,
+            "category": classify_category(canonical_name),
+            "amc": "Unknown",
+            "code": code,
+        }
+
+    return None
+
+
 def build_fund_universe(settings: Settings, holdings: dict[str, Holding]) -> list[FundRecord]:
     logger.info(
         "Initializing data providers: mftool=%s TigZig_enabled=%s TigZig_base=%s Kaggle_legacy=%s",
         _MFTOOL_VERSION, TIGZIG_NAV_ENABLED, TIGZIG_NAV_BASE_URL, KAGGLE_NAV_ENABLED,
     )
     mf = Mftool()
-    raw = fetch_universe(settings, mf)
+    schemes = mf.get_scheme_codes()
+    raw = fetch_universe(settings, mf, schemes=schemes)
+
+    resolved_holdings = 0
+    unresolved_holdings = 0
+    existing_names = {x["scheme_name"].lower() for x in raw}
     for name in holdings:
-        if not any(x["scheme_name"].lower() == name.lower() for x in raw):
-            raw.append({"scheme_name": name, "category": "Holding Scheme", "amc": "Unknown", "code": ""})
+        if name.lower() in existing_names:
+            continue
+
+        resolved = _resolve_holding_scheme(name, schemes)
+        if resolved:
+            raw.append(resolved)
+            existing_names.add(resolved["scheme_name"].lower())
+            resolved_holdings += 1
+        else:
+            # Keep unresolved holdings visible for portfolio reconciliation, but
+            # mark them as non-actionable. They must never enter BUY/TRIM logic.
+            raw.append({
+                "scheme_name": name,
+                "category": "Unresolved Holding",
+                "amc": "Unknown",
+                "code": "",
+            })
+            existing_names.add(name.lower())
+            unresolved_holdings += 1
+
+    logger.info(
+        "Holding identity resolution: resolved=%d unresolved=%d total=%d.",
+        resolved_holdings, unresolved_holdings, len(holdings),
+    )
 
     records: list[FundRecord] = []
 
