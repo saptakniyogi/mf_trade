@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any
 
 
-ENGINE_VERSION = "2.5.1"
+ENGINE_VERSION = "2.5.2"
 RANKING_EVIDENCE_CAP = 49.99
 EPSILON = 1e-6
 PERCENT_EPSILON = 1e-4
@@ -171,6 +171,81 @@ def _eligible(item: dict[str, Any], route: str) -> bool:
 
 def _status(item: dict[str, Any], route: str) -> str:
     return str(_option(item, route).get("status") or "").upper()
+
+
+def _normalize_scheme_identity(name: Any) -> str:
+    """Normalize portfolio/AMFI names for plan-insensitive identity checks."""
+    import re
+
+    value = str(name or "").upper()
+    value = re.sub(r"[^A-Z0-9]+", " ", value)
+    removable = {
+        "DIRECT", "REGULAR", "PLAN", "GROWTH", "IDCW", "DIVIDEND",
+        "PAYOUT", "REINVESTMENT", "REINVEST", "BONUS", "OPTION",
+    }
+    return " ".join(
+        token for token in value.split() if token not in removable
+    ).strip()
+
+
+def _check_portfolio_identity(data: dict[str, Any]) -> CheckResult:
+    """Verify holdings are reconciled to canonical evaluated fund identities."""
+    result = CheckResult("Portfolio identity")
+    portfolio = data.get("portfolio") or {}
+    holdings = portfolio.get("holdings") or {}
+    funds = data.get("evaluated_funds") or []
+
+    if not isinstance(holdings, dict):
+        result.fail("portfolio.holdings must be an object.")
+        return result
+
+    canonical = {}
+    for item in funds:
+        if not isinstance(item, dict):
+            continue
+        name = _fund_name(item)
+        identity = _normalize_scheme_identity(name)
+        if identity:
+            canonical.setdefault(identity, []).append(item)
+
+    for holding_name in holdings:
+        identity = _normalize_scheme_identity(holding_name)
+        matches = canonical.get(identity, [])
+        if not matches:
+            result.fail(
+                f"Holding {holding_name!r} does not resolve to an evaluated canonical fund."
+            )
+            continue
+        if len(matches) > 1:
+            result.warn(
+                f"Holding {holding_name!r} matches multiple evaluated funds: "
+                + ", ".join(_fund_name(item) for item in matches)
+            )
+
+    exposure = portfolio.get("existing_exposure") or {}
+    category_weights = exposure.get("category_weights") or {}
+    amc_weights = exposure.get("amc_weights") or {}
+    total_value = exposure.get("total_value")
+
+    if holdings and _finite_number(total_value) and float(total_value) > 0:
+        category_total = sum(
+            float(value) for value in category_weights.values()
+            if _finite_number(value)
+        )
+        amc_total = sum(
+            float(value) for value in amc_weights.values()
+            if _finite_number(value)
+        )
+        if not math.isclose(category_total, 100.0, abs_tol=0.05):
+            result.fail(
+                f"Existing category exposure totals {category_total:.2f}%, expected ~100%."
+            )
+        if not math.isclose(amc_total, 100.0, abs_tol=0.05):
+            result.fail(
+                f"Existing AMC exposure totals {amc_total:.2f}%, expected ~100%."
+            )
+
+    return result
 
 
 def _check_data_integrity(data: dict[str, Any]) -> CheckResult:
@@ -733,10 +808,10 @@ def _check_allocations(data: dict[str, Any]) -> CheckResult:
                 f"({expected_amount:.2f})."
             )
 
-        if allocation.get("action") != "BUY":
+        if allocation.get("action") not in {"BUY", "ACCUMULATE"}:
             result.fail(
                 f"{name}: allocated fund has action={allocation.get('action')!r}, "
-                "expected BUY."
+                "expected BUY or ACCUMULATE."
             )
 
         total_pct += pct
@@ -821,6 +896,7 @@ def audit(data: dict[str, Any], input_file: str = "<memory>") -> AuditResult:
         _check_ranking(data),
         _check_investment_modes(data),
         _check_portfolio_safety(data, holding_names),
+        _check_portfolio_identity(data),
         _check_allocations(data),
     ]
 
@@ -861,7 +937,8 @@ def print_report(result: AuditResult, strict: bool = False) -> None:
     print(f"Ranking inconsistencies:       {len(result.checks[3].failures)}")
     print(f"Investment-mode violations:    {len(result.checks[4].failures)}")
     print(f"Portfolio safety violations:  {len(result.checks[5].failures)}")
-    print(f"Allocation calculation errors: {len(result.checks[6].failures)}")
+    print(f"Portfolio identity failures:    {len(result.checks[6].failures)}")
+    print(f"Allocation calculation errors: {len(result.checks[7].failures)}")
     print(f"Warnings:                      {result.warning_count}")
     print()
 

@@ -11,6 +11,48 @@ from .models import FundRecord, Holding, FundScore
 ROUTE_RECOMMENDATION_SCORE = 50.0
 
 
+def normalize_scheme_identity(name: str) -> str:
+    """Return a plan-insensitive canonical identity for fund-name matching.
+
+    Zerodha/portfolio exports often use names such as ``DIRECT PLAN`` while
+    AMFI universe records use ``Direct Growth``. Plan/distribution suffixes
+    must not prevent an existing holding from matching its canonical fund.
+    """
+    import re
+
+    value = str(name or "").upper()
+    value = re.sub(r"[^A-Z0-9]+", " ", value)
+    removable = {
+        "DIRECT", "REGULAR", "PLAN", "GROWTH", "IDCW", "DIVIDEND",
+        "PAYOUT", "REINVESTMENT", "REINVEST", "BONUS", "OPTION",
+    }
+    return " ".join(
+        token for token in value.split() if token not in removable
+    ).strip()
+
+
+def holding_for_fund(
+    fund: FundRecord,
+    holdings: dict[str, Holding],
+) -> Holding | None:
+    """Resolve a canonical fund record to its existing portfolio holding."""
+    target = normalize_scheme_identity(fund.scheme_name)
+    if not target:
+        return None
+
+    exact = [
+        holding
+        for name, holding in holdings.items()
+        if normalize_scheme_identity(name) == target
+    ]
+    if not exact:
+        return None
+    if len(exact) == 1:
+        return exact[0]
+    return max(exact, key=lambda holding: holding.current_value)
+
+
+
 def existing_exposure(
     holdings: dict[str, Holding],
     funds: list[FundRecord],
@@ -19,9 +61,10 @@ def existing_exposure(
     by_category = defaultdict(float)
     by_amc = defaultdict(float)
 
-    for name, holding in holdings.items():
+    for holding in holdings.values():
+        target = normalize_scheme_identity(holding.scheme_name)
         fund = next(
-            (f for f in funds if f.scheme_name.lower() == name.lower()),
+            (f for f in funds if normalize_scheme_identity(f.scheme_name) == target),
             None,
         )
 
@@ -224,7 +267,7 @@ def allocation_for_candidates(
                     "capital_required": capital,
                     "action": (
                         "ACCUMULATE"
-                        if fund.scheme_name in holdings
+                        if holding_for_fund(fund, holdings) is not None
                         else "BUY"
                     ),
                     "evidence_status": score.evidence_status,
@@ -309,7 +352,7 @@ def allocation_for_candidates(
                 "capital_required": round(capital, 2),
                 "action": (
                     "ACCUMULATE"
-                    if fund.scheme_name in holdings
+                    if holding_for_fund(fund, holdings) is not None
                     else "BUY"
                 ),
                 "evidence_status": score.evidence_status,

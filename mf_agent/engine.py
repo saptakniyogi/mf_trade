@@ -9,7 +9,12 @@ from .data import build_fund_universe, load_holdings
 from .embeddings import retrieve_relevant_funds, retrieve_relevant_news
 from .macro import fetch_macro_snapshot
 from .news import classify_event, fetch_news, filter_relevant_news
-from .portfolio import allocation_for_candidates, existing_exposure, investment_option_status
+from .portfolio import (
+    allocation_for_candidates,
+    existing_exposure,
+    holding_for_fund,
+    investment_option_status,
+)
 from .ranking import diversify_shortlist, rank_candidates
 from .regime import infer_regime
 from .scenarios import scenario_matrix
@@ -104,8 +109,11 @@ class ResearchEngine:
             ),
             reverse=True,
         ):
-            is_holding = fund.scheme_name in holdings
-            is_unresolved_holding = is_holding and not fund.scheme_code
+            holding = holding_for_fund(fund, holdings)
+            is_holding = holding is not None
+            is_unresolved_holding = (
+                is_holding and not fund.scheme_code
+            )
 
             # Never issue a position-changing recommendation when the holding
             # cannot be mapped to a canonical AMFI scheme. Missing identity is a
@@ -132,8 +140,8 @@ class ResearchEngine:
                     "score": score.to_dict(),
                     "fund_metrics": fund.to_dict(),
                     "portfolio_performance": (
-                        asdict(holdings[fund.scheme_name])
-                        if fund.scheme_name in holdings
+                        asdict(holding)
+                        if holding is not None
                         else None
                     ),
                     "allocation": allocation_map.get(
@@ -185,9 +193,18 @@ class ResearchEngine:
             else:
                 item["quantitative_investment_mode"] = "NEITHER"
 
-            if not is_holding and (one_time_recommended or sip_recommended):
+            route_holding = holding_for_fund(fund_record, holdings)
+            route_is_holding = route_holding is not None
+            route_is_unresolved = route_is_holding and not fund_record.scheme_code
+
+            if not route_is_holding and (one_time_recommended or sip_recommended):
                 item["action"] = "BUY"
-            elif is_holding and not is_unresolved_holding and sip_recommended and item["action"] == "WAIT":
+            elif (
+                route_is_holding
+                and not route_is_unresolved
+                and sip_recommended
+                and item["action"] == "WAIT"
+            ):
                 item["action"] = "ACCUMULATE"
 
         ranked_for_review = rank_candidates(
@@ -227,7 +244,7 @@ class ResearchEngine:
         )
 
         return {
-            "engine_version": "2.5.1",
+            "engine_version": "2.5.2",
             "settings": {
                 "horizon": asdict(self.settings.horizon),
                 "investment_amount": float(
