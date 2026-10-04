@@ -61,9 +61,11 @@ CATEGORY_RULES = [
 ]
 
 MFDATA_BASE_URL = os.getenv("MF_DATA_API_URL", "https://mfdata.in").rstrip("/")
+MFDATA_ENABLED = os.getenv("MF_DATA_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
+MFDATA_HEALTHCHECK_TIMEOUT_SECONDS = max(1, min(5, int(os.getenv("MF_DATA_HEALTHCHECK_TIMEOUT_SECONDS", "2"))))
 MFDATA_CACHE_TTL_HOURS = max(1.0, float(os.getenv("MF_DATA_CACHE_TTL_HOURS", "24")))
 MFDATA_FAMILY_ENRICHMENT_LIMIT = max(0, min(20, int(os.getenv("MF_DATA_FAMILY_ENRICHMENT_LIMIT", "20"))))
-MFDATA_TIMEOUT_SECONDS = max(3, min(15, int(os.getenv("MF_DATA_TIMEOUT_SECONDS", "10"))))
+MFDATA_TIMEOUT_SECONDS = max(2, min(8, int(os.getenv("MF_DATA_TIMEOUT_SECONDS", "5"))))
 MFDATA_BULK_CHUNK_SIZE = max(25, min(100, int(os.getenv("MF_DATA_BULK_CHUNK_SIZE", "50"))))
 MFDATA_MAX_WORKERS = max(1, min(12, int(os.getenv("MF_DATA_MAX_WORKERS", "6"))))
 MFDATA_INDIVIDUAL_FALLBACK_LIMIT = max(0, min(20, int(os.getenv("MF_DATA_INDIVIDUAL_FALLBACK_LIMIT", "20"))))
@@ -1105,6 +1107,38 @@ def _write_cache(path: Path, payload) -> None:
         tmp.replace(path)
     except Exception as exc:
         logger.debug("Could not cache mfdata response: %s", exc)
+def _mfdata_is_available() -> bool:
+    """Return whether mfdata.in is reachable before starting bulk enrichment.
+
+    mfdata.in is an optional enrichment provider. A dead or stalled provider
+    must never add tens of seconds of connection/read timeouts to every run.
+    The health endpoint is unauthenticated according to the provider docs.
+    """
+    if not MFDATA_ENABLED:
+        return False
+    url = f"{MFDATA_BASE_URL}/api/health"
+    try:
+        response = requests.get(
+            url,
+            timeout=MFDATA_HEALTHCHECK_TIMEOUT_SECONDS,
+            headers={"User-Agent": "MF Research Dashboard/2.5", "Accept": "application/json"},
+        )
+        if response.status_code != 200:
+            logger.warning("mfdata health check returned HTTP %s; skipping provider for this run.", response.status_code)
+            return False
+        payload = response.json()
+        if isinstance(payload, dict) and str(payload.get("status", "ok")).lower() in {"ok", "healthy", "success"}:
+            return True
+        logger.warning("mfdata health check returned an unexpected payload; skipping provider for this run.")
+        return False
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+        logger.warning("mfdata health check failed; skipping provider for this run: %s", exc)
+        return False
+    except (ValueError, requests.exceptions.RequestException) as exc:
+        logger.warning("mfdata health check could not be validated; skipping provider for this run: %s", exc)
+        return False
+
+
 def _mfdata_get(session: requests.Session, settings: Settings, path: str, params: dict | None = None):
     url = f"{MFDATA_BASE_URL}{path}"
     cache = _cache_path(settings, url, params)
@@ -1264,42 +1298,42 @@ def _record_mfdata_detail(record: FundRecord, detail: dict) -> None:
     nav = _number(detail.get("nav"))
     if nav is not None and record.latest_nav is None:
         record.latest_nav = nav
-        record.data_sources["latest_nav"] = "mfdata.in scheme details"
+        record.data_sources["latest_nav"] = "mfdata scheme details"
     if detail.get("nav_date") and record.nav_date is None:
         record.nav_date = detail.get("nav_date")
-        record.data_sources["nav_date"] = "mfdata.in scheme details"
+        record.data_sources["nav_date"] = "mfdata scheme details"
     aum = _number(detail.get("aum_cr", detail.get("aum_inr_cr")))
     if aum is not None and record.aum_inr_cr is None:
         record.aum_inr_cr = aum
-        record.data_sources["aum_inr_cr"] = "mfdata.in scheme details"
+        record.data_sources["aum_inr_cr"] = "mfdata scheme details"
     if detail.get("inception_date") and record.inception_date is None:
         record.inception_date = detail.get("inception_date")
-        record.data_sources["inception_date"] = "mfdata.in scheme details"
+        record.data_sources["inception_date"] = "mfdata scheme details"
     benchmark = detail.get("benchmark")
     if benchmark and record.benchmark is None and str(benchmark).strip() not in {"-", "NA", "N/A"}:
         record.benchmark = str(benchmark).strip()
-        record.data_sources["benchmark"] = "mfdata.in scheme details"
+        record.data_sources["benchmark"] = "mfdata scheme details"
 
     returns = _extract_returns(detail)
     for field, value in returns.items():
         if getattr(record, field) is None:
             setattr(record, field, value)
-            record.data_sources[field] = "mfdata.in scheme details"
+            record.data_sources[field] = "mfdata scheme details"
 
     ratio_metrics = _extract_ratio_metrics(detail)
     for field in ("sharpe", "sortino", "volatility_pct"):
         value = ratio_metrics.get(field)
         if value is not None and getattr(record, field) is None:
             setattr(record, field, value)
-            record.data_sources[field] = "mfdata.in scheme details"
+            record.data_sources[field] = "mfdata scheme details"
     if ratio_metrics.get("valuation"):
         record.valuation.update(ratio_metrics["valuation"])
-        record.data_sources["valuation"] = "mfdata.in scheme details"
+        record.data_sources["valuation"] = "mfdata scheme details"
 
     family_id = detail.get("family_id")
     if family_id is not None:
         record._mfdata_family_id = str(family_id)
-        record.data_sources["family_id"] = "mfdata.in scheme details"
+        record.data_sources["family_id"] = "mfdata scheme details"
 
 
 def _fetch_mfdata_detail(settings: Settings, record: FundRecord):
@@ -1320,6 +1354,14 @@ def _fetch_family_holdings(settings: Settings, family_id: str):
 def _enrich_from_mfdata(settings: Settings, records: list[FundRecord], holdings: dict[str, Holding]) -> None:
     """Enrich selected funds from mfdata with bulk-first, per-scheme fallback."""
     if not records:
+        return
+
+    if not MFDATA_ENABLED:
+        logger.info("mfdata enrichment disabled by MF_DATA_ENABLED=false.")
+        return
+
+    if not _mfdata_is_available():
+        logger.info("mfdata enrichment skipped because the provider is unavailable.")
         return
 
     session = _make_session()
@@ -1399,13 +1441,13 @@ def _enrich_from_mfdata(settings: Settings, records: list[FundRecord], holdings:
                 for record in family_to_records.get(str(family_id), []):
                     if fund_holdings:
                         record.holdings.update(fund_holdings)
-                        record.data_sources["holdings"] = "mfdata.in family holdings"
+                        record.data_sources["holdings"] = "mfdata family holdings"
                     if sectors:
                         record.sector_weights.update(sectors)
-                        record.data_sources["sector_weights"] = "mfdata.in family holdings"
+                        record.data_sources["sector_weights"] = "mfdata family holdings"
                     if market_caps:
                         record.market_cap_weights.update(market_caps)
-                        record.data_sources["market_cap_weights"] = "mfdata.in family holdings"
+                        record.data_sources["market_cap_weights"] = "mfdata family holdings"
                     if fund_holdings or sectors or market_caps:
                         record.source_quality = 1.0
 

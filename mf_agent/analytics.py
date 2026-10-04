@@ -114,12 +114,12 @@ def evidence_status(
 ) -> tuple[str, bool, list[str]]:
     """Return evidence status and whether the fund can receive fresh allocation.
 
-    A long-term recommendation requires at least the configured historical
-    horizon plus risk evidence. Equity funds also require holdings evidence.
-    Debt-like funds are not penalized for equity-specific holdings/sector data,
-    but they still require a meaningful return/risk history.
+    Performance/risk evidence is required for allocation. Holdings and sector
+    data are treated as portfolio-fit evidence rather than a hard eligibility
+    gate because those disclosures are periodic and may be unavailable when a
+    third-party holdings provider is down. Missing holdings still reduce data
+    confidence and prevent overlap analysis.
     """
-    debt_like = _is_debt_like(fund)
     blockers: list[str] = []
 
     if data_confidence < min_allocation_confidence:
@@ -142,9 +142,6 @@ def evidence_status(
 
     if fund.benchmark is None:
         blockers.append("Benchmark is required.")
-
-    if not debt_like and not fund.holdings:
-        blockers.append("Underlying holdings are required for equity portfolio-fit analysis.")
 
     if blockers:
         return "INSUFFICIENT_DATA", False, blockers
@@ -193,12 +190,10 @@ def fund_quality_score(
 
     quality = sum(scores) / len(scores)
 
-    # Core historical evidence is mandatory for a long-term strategy.
     if min_history_years >= 3 and fund.cagr_3y_pct is None:
         warnings.append("Quality score capped because 3-year return history is unavailable.")
         quality = min(quality, 45.0)
 
-    # A missing risk history should also prevent a high-confidence quality score.
     if fund.sharpe is None and fund.sortino is None:
         warnings.append("Quality score capped because risk-adjusted return data is unavailable.")
         quality = min(quality, 45.0)
