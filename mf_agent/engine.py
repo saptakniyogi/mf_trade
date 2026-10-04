@@ -23,6 +23,8 @@ from .scoring import score_fund
 
 logger = logging.getLogger("mf_agent")
 
+ENGINE_VERSION = "2.6.2"
+
 
 def _trim_reason(score) -> str | None:
     """Return explicit deterministic evidence required before recommending TRIM."""
@@ -476,7 +478,7 @@ class ResearchEngine:
         )
 
         return {
-            "engine_version": "2.6.0",
+            "engine_version": ENGINE_VERSION,
             "settings": {
                 "horizon": asdict(self.settings.horizon),
                 "investment_amount": float(
