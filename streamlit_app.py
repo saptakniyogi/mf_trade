@@ -112,6 +112,30 @@ def score_fmt(value):
     return f"{value:.1f}"
 
 
+def display_df(frame: pd.DataFrame, **kwargs):
+    """Render tables without turning missing values into visually empty cells."""
+    kwargs.pop("hide_index", None)
+    kwargs.pop("use_container_width", None)
+
+    if frame is None or frame.empty:
+        st.dataframe(
+            frame,
+            hide_index=True,
+            use_container_width=True,
+            **kwargs,
+        )
+        return
+
+    shown = frame.copy()
+    shown = shown.astype(object).where(pd.notna(shown), "Unavailable")
+    st.dataframe(
+        shown,
+        hide_index=True,
+        use_container_width=True,
+        **kwargs,
+    )
+
+
 def load_result():
     if not OUTPUT_PATH.exists():
         return None
@@ -1089,7 +1113,7 @@ with tab_overview:
         }
     )
 
-    st.dataframe(
+    display_df(
         reg_df,
         hide_index=True,
         use_container_width=True,
@@ -1141,7 +1165,7 @@ with tab_overview:
             }
         )
 
-    st.dataframe(
+    display_df(
         pd.DataFrame(rows),
         hide_index=True,
         use_container_width=True,
@@ -1171,7 +1195,7 @@ with tab_overview:
                 "LLM": "Reviewed" if llm_review else "Not reviewed",
             })
 
-        st.dataframe(
+        display_df(
             pd.DataFrame(allocation_rows),
             hide_index=True,
             use_container_width=True,
@@ -1327,7 +1351,7 @@ with tab_funds:
             na_position="last",
         )
 
-    st.dataframe(
+    display_df(
         df,
         hide_index=True,
         use_container_width=True,
@@ -1508,7 +1532,7 @@ with tab_portfolio:
             f"({total_pnl_pct:.1f}%)",
         )
 
-        st.dataframe(
+        display_df(
             live_df,
             hide_index=True,
             use_container_width=True,
@@ -1561,7 +1585,7 @@ with tab_portfolio:
                 }
             )
 
-        st.dataframe(
+        display_df(
             pd.DataFrame(hrows),
             hide_index=True,
             use_container_width=True,
@@ -1587,7 +1611,7 @@ with tab_portfolio:
             )
 
             if isinstance(value, dict):
-                st.dataframe(
+                display_df(
                     pd.DataFrame(
                         [
                             {
@@ -1664,7 +1688,7 @@ with tab_macro:
             "Source": macro_sources.get(source_key, "Yahoo Finance" if value is not None else "No source"),
         })
 
-    st.dataframe(
+    display_df(
         pd.DataFrame(macro_rows_display),
         hide_index=True,
         use_container_width=True,
@@ -1685,7 +1709,7 @@ with tab_macro:
 
     st.subheader("Regime signals")
 
-    st.dataframe(
+    display_df(
         pd.DataFrame(
             regime.get("signals", [])
         ),
@@ -1775,7 +1799,7 @@ with tab_scenarios:
                     )
 
     if scenario_rows:
-        st.dataframe(
+        display_df(
             pd.DataFrame(scenario_rows),
             hide_index=True,
             use_container_width=True,
@@ -1800,7 +1824,7 @@ with tab_news:
     )
 
     if events:
-        st.dataframe(
+        display_df(
             pd.DataFrame(events),
             hide_index=True,
             use_container_width=True,
@@ -1865,7 +1889,7 @@ with tab_sip:
             })
 
         sip_df = pd.DataFrame(sip_rows)
-        st.dataframe(
+        display_df(
             sip_df,
             hide_index=True,
             use_container_width=True,
@@ -1922,7 +1946,7 @@ with tab_sip:
             })
 
     if availability_rows:
-        st.dataframe(
+        display_df(
             pd.DataFrame(availability_rows),
             hide_index=True,
             use_container_width=True,

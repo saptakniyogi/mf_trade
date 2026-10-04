@@ -51,11 +51,14 @@ def _macro_resilience(fund: FundRecord, regime: MarketRegime) -> float:
     return clamp(score)
 
 
-def _data_confidence(fund: FundRecord) -> float:
-    """Evidence completeness, not investment quality."""
+def _category_data_applicability(
+    fund: FundRecord,
+) -> tuple[bool, bool, bool, bool]:
+    """Return whether valuation/holdings/sector/market-cap are meaningful."""
+    category = fund.category.lower()
     debt_like = any(
-        x in fund.category.lower()
-        for x in (
+        token in category
+        for token in (
             "debt",
             "liquid",
             "overnight",
@@ -66,6 +69,27 @@ def _data_confidence(fund: FundRecord) -> float:
             "credit risk",
         )
     )
+    arbitrage_like = "arbitrage" in category
+
+    # Equity valuation is not an evidence requirement for debt or arbitrage.
+    # Sector and market-cap buckets are also not reliable completeness gates
+    # for these categories.
+    return (
+        not debt_like and not arbitrage_like,  # valuation
+        not debt_like,                         # holdings
+        not debt_like and not arbitrage_like,  # sector
+        not debt_like and not arbitrage_like,  # market cap
+    )
+
+
+def _data_confidence(fund: FundRecord) -> float:
+    """Evidence completeness, excluding fields that are not meaningful."""
+    (
+        valuation_applicable,
+        holdings_applicable,
+        sector_applicable,
+        market_cap_applicable,
+    ) = _category_data_applicability(fund)
 
     checks: list[tuple[bool, float]] = [
         (fund.cagr_1y_pct is not None, 8),
@@ -76,10 +100,10 @@ def _data_confidence(fund: FundRecord) -> float:
         (fund.max_drawdown_pct is not None, 10),
         (fund.aum_inr_cr is not None, 5),
         (fund.benchmark is not None, 5),
-        (bool(fund.valuation), 5),
-        (bool(fund.holdings) if not debt_like else True, 10),
-        (bool(fund.sector_weights) if not debt_like else True, 5),
-        (bool(fund.market_cap_weights) if not debt_like else True, 5),
+        (bool(fund.valuation) if valuation_applicable else True, 5),
+        (bool(fund.holdings) if holdings_applicable else True, 10),
+        (bool(fund.sector_weights) if sector_applicable else True, 5),
+        (bool(fund.market_cap_weights) if market_cap_applicable else True, 5),
         (fund.latest_nav is not None and fund.nav_date is not None, 5),
     ]
 
@@ -217,7 +241,14 @@ def score_fund(
             "Underlying holdings are unavailable, so overlap and factor analysis are incomplete."
         )
 
-    if valuation is None:
+    (
+        valuation_applicable,
+        _holdings_applicable,
+        sector_applicable,
+        market_cap_applicable,
+    ) = _category_data_applicability(fund)
+
+    if valuation is None and valuation_applicable:
         warnings.append("Valuation data unavailable.")
 
     if fund.benchmark is None:
@@ -226,10 +257,10 @@ def score_fund(
     if fund.aum_inr_cr is None:
         warnings.append("AUM unavailable.")
 
-    if not fund.sector_weights and "debt" not in fund.category.lower():
+    if not fund.sector_weights and sector_applicable:
         warnings.append("Sector weights unavailable.")
 
-    if not fund.market_cap_weights and "debt" not in fund.category.lower():
+    if not fund.market_cap_weights and market_cap_applicable:
         warnings.append("Market-cap weights unavailable.")
 
     not_buy = list(evidence_blockers)
