@@ -297,7 +297,7 @@ class ResearchEngine:
         )
 
         return {
-            "engine_version": "2.6.0",
+            "engine_version": "2.6.1",
             "settings": {
                 "horizon": asdict(self.settings.horizon),
                 "investment_amount": float(
