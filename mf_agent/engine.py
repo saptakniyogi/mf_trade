@@ -54,6 +54,176 @@ def _trim_reason(score) -> str | None:
     return None
 
 
+def _canonicalize_sip_recommendations(
+    recommendations: list[dict],
+    candidates: list[tuple[object, object]],
+    holdings: dict,
+    funds: list,
+    monthly_amount: float,
+    policy,
+    mode: str,
+) -> list[dict]:
+    """Normalize legacy SIP recommendation rows into the 2.6.2 allocation contract.
+
+    Older 2.6.x runs could expose SIP eligibility records instead of the
+    fund-level allocation plan. The engine must never publish that legacy
+    shape as ``sip_recommendations`` because the audit and dashboard consume
+    this field as an allocation plan.
+    """
+    required = {
+        "action",
+        "target_sip_pct",
+        "portfolio_capacity_pct",
+        "monthly_amount",
+        "allocation_pct_of_monthly_sip",
+    }
+
+    if not recommendations:
+        return recommendations
+
+    if all(required.issubset(item.keys()) for item in recommendations if isinstance(item, dict)):
+        return recommendations
+
+    # Prefer the deterministic allocator again. This path is deliberately
+    # defensive: it repairs a legacy allocator result without changing scores
+    # or the investment-ranking formula.
+    from .portfolio import sip_allocation_for_candidates as _sip_allocator
+
+    canonical = _sip_allocator(
+        candidates,
+        holdings,
+        funds,
+        monthly_amount,
+        policy,
+        mode,
+    )
+    if canonical and all(required.issubset(item.keys()) for item in canonical):
+        return canonical
+
+    # If a legacy portfolio implementation is still imported at runtime,
+    # construct the same deterministic allocation contract here from the
+    # already-qualified candidates. This is intentionally the same strength
+    # weighting used by the 2.6.1 allocator.
+    from collections import defaultdict
+    from .portfolio import existing_exposure, holding_for_fund, ROUTE_RECOMMENDATION_SCORE
+
+    exposure = existing_exposure(holdings, funds)
+    total_value = float(exposure.get("total_value", 0.0) or 0.0)
+
+    eligible = [
+        (fund, score)
+        for fund, score in sorted(
+            candidates,
+            key=lambda x: x[1].ranking_score,
+            reverse=True,
+        )
+        if score.allocation_eligible
+        and score.evidence_status == "ELIGIBLE"
+        and score.ranking_score >= ROUTE_RECOMMENDATION_SCORE
+        and score.macro_resilience >= 45.0
+    ]
+
+    if str(mode or "DIVERSIFIED").upper() == "CONCENTRATED":
+        eligible = eligible[: max(1, int(policy.max_concentrated_funds))]
+
+    # Recover capacity from the legacy recommendation when available. This
+    # avoids inventing a different portfolio-capacity calculation merely to
+    # repair the schema.
+    legacy_by_name = {
+        str(item.get("scheme_name")): item
+        for item in recommendations
+        if isinstance(item, dict)
+    }
+
+    strengths = {
+        fund.scheme_name: max(
+            1.0,
+            float(score.ranking_score) - ROUTE_RECOMMENDATION_SCORE,
+        )
+        for fund, score in eligible
+    }
+    total_strength = sum(strengths.values()) or float(len(eligible))
+
+    rows = []
+    for fund, score in eligible:
+        legacy = legacy_by_name.get(fund.scheme_name, {})
+        nested_options = legacy.get("investment_options") or {}
+        legacy_capacity = nested_options.get("portfolio_capacity_pct")
+
+        if isinstance(legacy_capacity, (int, float)):
+            capacity_pct = max(0.0, min(100.0, float(legacy_capacity)))
+        else:
+            capacity_pct = 0.0
+
+        if capacity_pct <= 0.0:
+            # A missing capacity is not treated as unlimited. The allocator
+            # contract requires a real capacity value.
+            continue
+
+        target_pct = strengths[fund.scheme_name] / total_strength * 100.0
+        max_monthly = (
+            total_value * capacity_pct / 100.0
+            if total_value > 0
+            else None
+        )
+        desired = (
+            float(monthly_amount) * target_pct / 100.0
+            if monthly_amount > 0
+            else 0.0
+        )
+        amount = (
+            min(desired, max_monthly)
+            if max_monthly is not None
+            else desired
+        )
+        holding = holding_for_fund(fund, holdings)
+
+        rows.append({
+            "scheme_name": fund.scheme_name,
+            "category": fund.category,
+            "amc": fund.amc,
+            "action": "ACCUMULATE" if holding is not None else "BUY",
+            "score": score.overall,
+            "ranking_score": score.ranking_score,
+            "data_confidence": score.data_confidence,
+            "evidence_status": score.evidence_status,
+            "portfolio_capacity_pct": round(capacity_pct, 2),
+            "target_sip_pct": round(target_pct, 2),
+            "monthly_amount": round(amount, 2),
+            "max_monthly_amount": round(max_monthly, 2) if max_monthly is not None else None,
+            "allocation_pct_of_monthly_sip": (
+                round(amount / float(monthly_amount) * 100.0, 2)
+                if monthly_amount > 0
+                else 0.0
+            ),
+            "reason": (
+                "Deterministic SIP candidate: passes evidence, score, macro "
+                "and portfolio-capacity gates."
+            ),
+            "final_action": "ACCUMULATE" if holding is not None else "BUY",
+            "sip_monthly_amount": round(amount, 2),
+        })
+
+    # Reconcile rounding and capacity so the actual monthly amounts never
+    # exceed the configured SIP budget.
+    if monthly_amount > 0 and rows:
+        remaining = float(monthly_amount)
+        for row in sorted(rows, key=lambda x: x["ranking_score"], reverse=True):
+            amount = min(
+                max(0.0, float(row["monthly_amount"])),
+                remaining,
+            )
+            row["monthly_amount"] = round(amount, 2)
+            row["sip_monthly_amount"] = row["monthly_amount"]
+            row["allocation_pct_of_monthly_sip"] = round(
+                amount / float(monthly_amount) * 100.0,
+                2,
+            )
+            remaining -= amount
+
+    return rows
+
+
 class ResearchEngine:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -136,6 +306,15 @@ class ResearchEngine:
             and score.evidence_status == "ELIGIBLE"
         ]
         sip_recommendations = sip_allocation_for_candidates(
+            sip_candidates,
+            holdings,
+            funds,
+            self.settings.sip_monthly_amount,
+            self.settings.policy,
+            self.settings.allocation_mode,
+        )
+        sip_recommendations = _canonicalize_sip_recommendations(
+            sip_recommendations,
             sip_candidates,
             holdings,
             funds,
@@ -297,7 +476,7 @@ class ResearchEngine:
         )
 
         return {
-            "engine_version": "2.6.1",
+            "engine_version": "2.6.0",
             "settings": {
                 "horizon": asdict(self.settings.horizon),
                 "investment_amount": float(

@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any
 
 
-ENGINE_VERSION = "2.6.1"
+ENGINE_VERSION = "2.6.2"
 RANKING_EVIDENCE_CAP = 49.99
 EPSILON = 1e-6
 PERCENT_EPSILON = 1e-4
