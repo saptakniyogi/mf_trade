@@ -18,6 +18,7 @@ Checks:
 5. Independent SIP / one-time routing
 6. Existing-portfolio safety
 7. Allocation mathematics and policy limits
+8. SIP allocation contract and budget mathematics
 
 This file audits the JSON contract emitted by engine.py. It does not attempt
 to reproduce the proprietary/implementation-specific scoring formula. Instead,
@@ -36,7 +37,7 @@ from pathlib import Path
 from typing import Any
 
 
-ENGINE_VERSION = "2.6.0"
+ENGINE_VERSION = "2.6.1"
 RANKING_EVIDENCE_CAP = 49.99
 EPSILON = 1e-6
 PERCENT_EPSILON = 1e-4
@@ -929,6 +930,33 @@ def _check_sip_recommendations(data: dict[str, Any]) -> CheckResult:
         if not _finite_number(pct) or float(pct) < -PERCENT_EPSILON:
             result.fail(f"{name}: allocation_pct_of_monthly_sip is invalid.")
 
+        target_pct_value = item.get("target_sip_pct")
+        capacity_pct_value = item.get("portfolio_capacity_pct")
+
+        if _finite_number(target_pct_value):
+            target_pct = float(target_pct_value)
+            if target_pct < -PERCENT_EPSILON or target_pct > 100.0 + PERCENT_EPSILON:
+                result.fail(
+                    f"{name}: target_sip_pct={target_pct:.4f}% is outside 0..100%."
+                )
+
+        if _finite_number(capacity_pct_value):
+            capacity_pct = float(capacity_pct_value)
+            if capacity_pct < -PERCENT_EPSILON or capacity_pct > 100.0 + PERCENT_EPSILON:
+                result.fail(
+                    f"{name}: portfolio_capacity_pct={capacity_pct:.4f}% is outside 0..100%."
+                )
+
+        max_monthly = item.get("max_monthly_amount")
+        if max_monthly is not None:
+            if not _finite_number(max_monthly) or float(max_monthly) < -EPSILON:
+                result.fail(f"{name}: max_monthly_amount is invalid.")
+            elif float(amount) > float(max_monthly) + 0.01:
+                result.fail(
+                    f"{name}: monthly_amount=₹{float(amount):.2f} exceeds "
+                    f"max_monthly_amount=₹{float(max_monthly):.2f}."
+                )
+
         if float(monthly_amount) > 0:
             expected = float(monthly_amount) * float(pct) / 100.0
             if not _close(float(amount), expected, tolerance=0.01):
@@ -939,6 +967,16 @@ def _check_sip_recommendations(data: dict[str, Any]) -> CheckResult:
 
         total_amount += max(0.0, float(amount))
         total_pct += max(0.0, float(pct))
+
+    target_total = sum(
+        max(0.0, float(item.get("target_sip_pct", 0.0)))
+        for item in recommendations
+        if isinstance(item, dict)
+    )
+    if target_total > 100.0 + PERCENT_EPSILON:
+        result.fail(
+            f"SIP target percentages total {target_total:.4f}% > 100%."
+        )
 
     if total_pct > 100.0 + PERCENT_EPSILON:
         result.fail(f"SIP allocation percentages total {total_pct:.4f}% > 100%.")

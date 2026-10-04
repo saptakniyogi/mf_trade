@@ -428,30 +428,43 @@ def sip_allocation_for_candidates(
             else 0.0
         )
 
+        action = (
+            "ACCUMULATE"
+            if holding_for_fund(fund, holdings) is not None
+            else "BUY"
+        )
+        target_sip_pct = round(target_pct, 2)
+        monthly_sip_amount = round(recommended_monthly, 2)
+        max_monthly_amount = (
+            round(max_monthly, 2)
+            if max_monthly != float("inf")
+            else None
+        )
+
         rows.append({
+            # Canonical SIP allocation contract. These fields are consumed by
+            # the audit and the main dashboard and must remain present even
+            # when the monthly SIP budget is zero.
             "scheme_name": fund.scheme_name,
             "category": fund.category,
             "amc": fund.amc,
-            "action": (
-                "ACCUMULATE"
-                if holding_for_fund(fund, holdings) is not None
-                else "BUY"
-            ),
+            "action": action,
             "score": score.overall,
             "ranking_score": score.ranking_score,
             "data_confidence": score.data_confidence,
             "evidence_status": score.evidence_status,
             "portfolio_capacity_pct": round(capacity_pct, 2),
-            "target_sip_pct": round(target_pct, 2),
-            "monthly_amount": round(recommended_monthly, 2),
-            "max_monthly_amount": (
-                round(max_monthly, 2)
-                if max_monthly != float("inf")
-                else None
-            ),
+            "target_sip_pct": target_sip_pct,
+            "monthly_amount": monthly_sip_amount,
+            "max_monthly_amount": max_monthly_amount,
+            "allocation_pct_of_monthly_sip": 0.0,
             "reason": (
                 "Deterministic SIP candidate: passes evidence, score, macro and portfolio-capacity gates."
             ),
+            # Compatibility aliases make the contract self-describing for
+            # consumers that previously used the recommendation-only fields.
+            "final_action": action,
+            "sip_monthly_amount": monthly_amount,
         })
 
     if monthly_amount <= 0:
