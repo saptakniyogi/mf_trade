@@ -11,6 +11,9 @@ from .models import FundRecord, Holding, MarketRegime, FundScore
 from .utils import clamp, normalize
 
 
+RANKING_EVIDENCE_CAP = 49.99
+
+
 def _valuation_score(fund: FundRecord) -> float | None:
     pe = fund.valuation.get("pe")
     percentile = fund.valuation.get("historical_percentile")
@@ -182,12 +185,19 @@ def score_fund(
         min_allocation_confidence=70.0,
     )
 
-    if not allocation_eligible:
-        # Keep the quantitative score informative, but make the ranking score
-        # explicitly subordinate to evidence quality.
-        ranking_score = min(overall, 49.99)
-    else:
-        ranking_score = overall
+    # `overall` is the evidence-adjusted investment score. `ranking_score` is
+    # the score actually used for ordering candidates. Funds that are not
+    # evidence-qualified are deliberately capped so a high raw score cannot
+    # outrank funds with sufficient evidence. Keep the adjustment explicit so
+    # downstream audit/reporting can distinguish the raw score from the ranking
+    # policy rather than treating the difference as an unexplained mismatch.
+    ranking_cap = RANKING_EVIDENCE_CAP if not allocation_eligible else None
+    ranking_score = (
+        min(overall, ranking_cap)
+        if ranking_cap is not None
+        else overall
+    )
+    ranking_adjustment = ranking_score - overall
 
     if max_overlap > 60:
         warnings.append(
@@ -263,6 +273,8 @@ def score_fund(
         overall=round(overall, 2),
         data_confidence=data_confidence,
         ranking_score=round(ranking_score, 2),
+        ranking_cap=ranking_cap,
+        ranking_adjustment=round(ranking_adjustment, 2),
         evidence_status=status,
         allocation_eligible=allocation_eligible,
         evidence_blockers=evidence_blockers,

@@ -36,7 +36,8 @@ from pathlib import Path
 from typing import Any
 
 
-ENGINE_VERSION = "2.5.0"
+ENGINE_VERSION = "2.5.1"
+RANKING_EVIDENCE_CAP = 49.99
 EPSILON = 1e-6
 PERCENT_EPSILON = 1e-4
 
@@ -339,6 +340,8 @@ def _check_evidence_gate(
 def _check_score_consistency(data: dict[str, Any]) -> CheckResult:
     result = CheckResult("Score consistency")
     funds = data.get("evaluated_funds") or []
+    engine_version = str(data.get("engine_version") or "")
+    expects_explicit_ranking_policy = engine_version == ENGINE_VERSION
 
     component_fields = (
         "fund_quality",
@@ -357,24 +360,69 @@ def _check_score_consistency(data: dict[str, Any]) -> CheckResult:
         score = item.get("score") or {}
         overall = score.get("overall")
         ranking_score = score.get("ranking_score")
+        evidence_status = score.get("evidence_status")
+        allocation_eligible = bool(score.get("allocation_eligible", False))
+        ranking_cap = score.get("ranking_cap")
+        ranking_adjustment = score.get("ranking_adjustment")
 
         if _finite_number(overall) and _finite_number(ranking_score):
-            if not _pct_close(overall, ranking_score):
-                evidence_status = score.get("evidence_status")
-                if evidence_status == "ELIGIBLE":
+            if allocation_eligible and evidence_status == "ELIGIBLE":
+                if not _pct_close(overall, ranking_score):
                     result.fail(
                         f"{name}: ranking_score={ranking_score} does not match "
                         f"overall={overall} for an evidence-qualified fund."
                     )
-                else:
-                    # The engine may apply a ranking penalty to funds that are
-                    # not evidence-qualified. That is intentionally different
-                    # from the raw overall score and must not be treated as a
-                    # score-calculation error.
+                if ranking_cap is not None:
+                    result.fail(
+                        f"{name}: eligible fund must not have ranking_cap={ranking_cap!r}."
+                    )
+                if ranking_adjustment is not None and not _pct_close(
+                    ranking_adjustment, 0.0
+                ):
+                    result.fail(
+                        f"{name}: eligible fund has ranking_adjustment="
+                        f"{ranking_adjustment}, expected 0.0."
+                    )
+            else:
+                expected_cap = RANKING_EVIDENCE_CAP
+                expected_ranking = min(float(overall), expected_cap)
+                expected_adjustment = expected_ranking - float(overall)
+
+                if expects_explicit_ranking_policy:
+                    if not _pct_close(ranking_cap, expected_cap):
+                        result.fail(
+                            f"{name}: ranking_cap={ranking_cap!r} does not match "
+                            f"the evidence cap {expected_cap:.2f}."
+                        )
+                    if not _pct_close(ranking_score, expected_ranking):
+                        result.fail(
+                            f"{name}: ranking_score={ranking_score} does not match "
+                            f"min(overall={overall}, ranking_cap={expected_cap:.2f})="
+                            f"{expected_ranking:.2f}."
+                        )
+                    if not _pct_close(ranking_adjustment, expected_adjustment):
+                        result.fail(
+                            f"{name}: ranking_adjustment={ranking_adjustment} does not "
+                            f"match ranking_score - overall = {expected_adjustment:.2f}."
+                        )
+                elif not _pct_close(overall, ranking_score):
+                    # 2.5.0 output did not expose the ranking policy fields, so
+                    # retain compatibility with historical analysis files.
                     result.warn(
-                        f"{name}: ranking_score={ranking_score} differs from "
-                        f"overall={overall} because evidence_status="
-                        f"{evidence_status!r}."
+                        f"{name}: legacy engine output has ranking_score={ranking_score} "
+                        f"below overall={overall}; rerun with engine {ENGINE_VERSION} "
+                        "to expose and audit the evidence-ranking cap explicitly."
+                    )
+
+        if expects_explicit_ranking_policy:
+            if not _finite_number(ranking_adjustment):
+                result.fail(
+                    f"{name}: score.ranking_adjustment must be a finite number."
+                )
+            if evidence_status != "ELIGIBLE" or not allocation_eligible:
+                if not _finite_number(ranking_cap):
+                    result.fail(
+                        f"{name}: ineligible fund must expose numeric ranking_cap."
                     )
 
         for field_name in component_fields:

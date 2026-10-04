@@ -126,6 +126,8 @@ class FundScore:
     overall: float
     data_confidence: float = 0.0
     ranking_score: float = 0.0
+    ranking_cap: float | None = None
+    ranking_adjustment: float = 0.0
     evidence_status: str = "INSUFFICIENT_DATA"
     allocation_eligible: bool = False
     evidence_blockers: list[str] = field(default_factory=list)
